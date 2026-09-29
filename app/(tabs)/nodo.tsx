@@ -177,8 +177,12 @@ export default function NodoScreen() {
             gps: {
               lat: g.lat,
               lon: g.lon,
-              ...(g.speedMs != null ? { speedMs: g.speedMs } : {}),
-              ...(g.accuracyM != null ? { accuracyM: g.accuracyM } : {}),
+              // Android usa speed = -1 como "todavía no hay velocidad
+              // confiable" (no null). El contrato no permite negativos
+              // (una velocidad negativa no tiene sentido físico), así que
+              // se omite en vez de mandar basura que el backend rechazaría.
+              ...(g.speedMs != null && g.speedMs >= 0 ? { speedMs: g.speedMs } : {}),
+              ...(g.accuracyM != null && g.accuracyM >= 0 ? { accuracyM: g.accuracyM } : {}),
             },
           }
         : {}),
@@ -218,7 +222,7 @@ export default function NodoScreen() {
           : locationPermission === 'unknown'
             ? 'Pidiendo permiso...'
             : gps
-              ? `${gps.speedMs != null ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
+              ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
                 `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m)`
               : 'Esperando fix de GPS...'}
       </Text>
