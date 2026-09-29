@@ -24,6 +24,8 @@ type Status = 'idle' | 'connecting' | 'connected' | 'error';
 type NodeRole = 'primary' | 'backup';
 type LocationPermission = 'unknown' | 'granted' | 'denied';
 type NodeMode = 'normal' | 'inspection' | 'alarm';
+type EventKind = 'impact' | 'door_open' | 'door_closed' | 'rollover' | 'threshold_exceeded';
+type EventSeverity = 'info' | 'warning' | 'critical';
 
 interface GpsReading {
   lat: number;
@@ -56,8 +58,31 @@ const MOVEMENT_EXIT_G = 0.03;
 const ROTATION_ENTER_RAD_S = 0.35;
 const ROTATION_EXIT_RAD_S = 0.15;
 
+// Eventos de borde (Fase 2) — se detectan del lado del nodo aunque no
+// haya señal (el outbox de la Fase 3 es lo que falta para no perderlos
+// sin conexión; por ahora, si no está conectado, publishEvent no hace
+// nada — igual que publishTelemetry).
+const DEFAULT_IMPACT_THRESHOLD_G = 2.5;
+// >1.5x el umbral se considera critical, si no warning — evita que todo
+// impacto sea "critical" sin distinción.
+const IMPACT_CRITICAL_MULTIPLIER = 1.5;
+const ROLLOVER_ANGLE_DEG = 60;
+const ROLLOVER_SUSTAIN_MS = 2000;
+
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
+}
+
+/** Ángulo entre la lectura actual y una referencia "vertical" (en
+ *  grados) — para volcadura, no importa la magnitud de cada vector, solo
+ *  qué tanto rotó respecto a como estaba al calibrar. */
+function angleFromReferenceDeg(current: AccelerometerMeasurement, reference: AccelerometerMeasurement): number {
+  const dot = current.x * reference.x + current.y * reference.y + current.z * reference.z;
+  const magCurrent = magnitude(current);
+  const magRef = magnitude(reference);
+  if (magCurrent === 0 || magRef === 0) return 0;
+  const cos = Math.min(1, Math.max(-1, dot / (magCurrent * magRef)));
+  return (Math.acos(cos) * 180) / Math.PI;
 }
 
 function gyroMagnitude(g: GyroscopeMeasurement): number {
@@ -110,6 +135,21 @@ export default function NodoScreen() {
   const movementEmaRef = useRef(0);
   const [gyroAvailable, setGyroAvailable] = useState<boolean | null>(null);
   const rotationEmaRef = useRef(0);
+
+  // Impacto: umbral configurable, disparo en el flanco de subida (no
+  // repite mientras se mantenga por encima) para no inundar de eventos
+  // durante un jaloneo sostenido.
+  const [impactThresholdG, setImpactThresholdG] = useState(String(DEFAULT_IMPACT_THRESHOLD_G));
+  const wasAboveImpactRef = useRef(false);
+
+  // Volcadura: referencia "vertical" tomada de la primera lectura (se
+  // puede recalibrar a mano con el botón de abajo). rolloverSinceRef
+  // marca cuándo empezó a estar inclinado; solo dispara si se sostiene
+  // ROLLOVER_SUSTAIN_MS, y no repite mientras siga volcado.
+  const referenceGravityRef = useRef<AccelerometerMeasurement | null>(null);
+  const rolloverSinceRef = useRef<number | null>(null);
+  const rolloverFiredRef = useRef(false);
+  const [lastRolloverAngle, setLastRolloverAngle] = useState<number | null>(null);
   // Puente hacia el poll() del efecto de GPS (más abajo), para poder
   // pedirle una lectura anticipada al detectar un jaloneo fuerte, sin
   // esperar el intervalo programado. Ver MOVEMENT_ENTER_G más abajo.
@@ -177,6 +217,39 @@ export default function NodoScreen() {
     }
   }
 
+  /** Publica un `event` del contrato. Se llama desde adentro de las
+   *  suscripciones a sensores (no desde el intervalo de auto-publicación),
+   *  por eso lee status/nodeId/unitId/role directo — la suscripción al
+   *  acelerómetro se reinicia cuando cualquiera de esos cambia (ver sus
+   *  deps más abajo), así que no quedan viejos como en un closure normal. */
+  function publishEvent(kind: EventKind, severity: EventSeverity, value?: number, threshold?: number) {
+    const client = clientRef.current;
+    if (!client || status !== 'connected') return;
+
+    seqRef.current += 1;
+    const g = gpsRef.current;
+    const payload = JSON.stringify({
+      contractVersion: '1.0.0',
+      msgId: uuidv4(),
+      nodeId,
+      unitId,
+      role,
+      seq: seqRef.current,
+      ts: Date.now(),
+      type: 'event',
+      kind,
+      severity,
+      ...(value != null ? { value } : {}),
+      ...(threshold != null ? { threshold } : {}),
+      ...(g ? { gps: { lat: g.lat, lon: g.lon } } : {}),
+    });
+
+    client.publish(`sitciit/${nodeId}/event`, payload, { qos: 1 }, (err) => {
+      if (err) appendLog(`Fallo al publicar evento ${kind}: ${err.message}`);
+      else appendLog(`Evento: ${kind} (${severity})`);
+    });
+  }
+
   // Disponibilidad de los sensores (se checa una vez).
   useEffect(() => {
     Accelerometer.isAvailableAsync().then(setAccelAvailable);
@@ -186,6 +259,12 @@ export default function NodoScreen() {
   // Suscripción al acelerómetro real. readingRef siempre tiene el último
   // valor (para leerlo desde el intervalo de auto-publicación sin closures
   // obsoletas); `reading` en estado es solo para pintar la UI.
+  //
+  // Detección de eventos en el borde (Fase 2): impacto y volcadura salen
+  // de esta misma lectura, no hace falta un sensor aparte. Depende de
+  // status/nodeId/unitId/role además de samplingMs porque publishEvent
+  // los lee directo (no por ref) — se reinicia la suscripción cuando
+  // cambian, así siempre están frescos dentro del listener.
   useEffect(() => {
     const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
     Accelerometer.setUpdateInterval(intervalMs);
@@ -194,9 +273,44 @@ export default function NodoScreen() {
       setReading(m);
       movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
       evaluateMovement();
+
+      // Impacto: flanco de subida sobre el umbral, no repite mientras
+      // se mantenga arriba.
+      const mag = magnitude(m);
+      const impactThreshold = Number(impactThresholdG) || DEFAULT_IMPACT_THRESHOLD_G;
+      const aboveImpact = mag > impactThreshold;
+      if (aboveImpact && !wasAboveImpactRef.current) {
+        const severity: EventSeverity =
+          mag > impactThreshold * IMPACT_CRITICAL_MULTIPLIER ? 'critical' : 'warning';
+        publishEvent('impact', severity, mag, impactThreshold);
+      }
+      wasAboveImpactRef.current = aboveImpact;
+
+      // Volcadura: primera lectura calibra "vertical"; después se mide
+      // el ángulo respecto a esa referencia (se puede recalibrar a mano).
+      if (!referenceGravityRef.current) {
+        referenceGravityRef.current = m;
+      } else {
+        const angle = angleFromReferenceDeg(m, referenceGravityRef.current);
+        setLastRolloverAngle(angle);
+        if (angle > ROLLOVER_ANGLE_DEG) {
+          if (rolloverSinceRef.current == null) {
+            rolloverSinceRef.current = Date.now();
+          } else if (
+            !rolloverFiredRef.current &&
+            Date.now() - rolloverSinceRef.current >= ROLLOVER_SUSTAIN_MS
+          ) {
+            rolloverFiredRef.current = true;
+            publishEvent('rollover', 'critical', angle, ROLLOVER_ANGLE_DEG);
+          }
+        } else {
+          rolloverSinceRef.current = null;
+          rolloverFiredRef.current = false;
+        }
+      }
     });
     return () => sub.remove();
-  }, [samplingMs]);
+  }, [samplingMs, status, nodeId, unitId, role, impactThresholdG]);
 
   // Suscripción al giroscopio real — misma frecuencia que el acelerómetro,
   // solo alimenta el indicador de movimiento (ver evaluateMovement).
@@ -502,6 +616,28 @@ export default function NodoScreen() {
       </View>
       <View style={styles.spacer} />
       <Button title="Publicar una vez" onPress={publishTelemetry} disabled={status !== 'connected'} />
+
+      <Text style={styles.sectionLabel}>Eventos en el borde</Text>
+      <Text style={styles.reading}>
+        Volcadura: {lastRolloverAngle != null ? `${lastRolloverAngle.toFixed(0)}°` : '—'} respecto a la vertical
+        {rolloverSinceRef.current != null ? ' (sostenido...)' : ''}
+      </Text>
+      <TextInput
+        style={styles.input} placeholderTextColor="#999999"
+        value={impactThresholdG}
+        onChangeText={setImpactThresholdG}
+        keyboardType="numeric"
+        placeholder="umbral de impacto en g (2.5 = default)"
+      />
+      <Button
+        title="Recalibrar vertical (volcadura)"
+        onPress={() => {
+          referenceGravityRef.current = readingRef.current;
+          rolloverSinceRef.current = null;
+          rolloverFiredRef.current = false;
+          appendLog('Vertical recalibrada');
+        }}
+      />
 
       <Text style={styles.status}>Estado: {status}</Text>
       {log.map((line, i) => (
