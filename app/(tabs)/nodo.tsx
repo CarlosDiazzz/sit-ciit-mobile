@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, ScrollView, StyleSheet, Switch, TextInput } from 'react-native';
-import { Accelerometer, type AccelerometerMeasurement } from 'expo-sensors';
+import { Accelerometer, Gyroscope, type AccelerometerMeasurement, type GyroscopeMeasurement } from 'expo-sensors';
 import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
 import mqtt, { type MqttClient } from 'mqtt';
@@ -40,17 +40,24 @@ const DEFAULT_GPS_INTERVAL_MS = 5000;
 // comentario junto a donde se usa (más abajo) para el porqué de bajarlo.
 const MIN_MOVEMENT_M = 3;
 
-// Indicador instantáneo de movimiento a partir del acelerómetro (no una
-// velocidad — el acelerómetro no sirve para eso, ver comentario arriba).
-// Solo dice "hay jaloneo distinto a estar quieto", con histéresis para no
-// parpadear justo en el umbral. Reacciona en el siguiente sample (~1 s),
-// mucho más rápido que el GPS, como complemento mientras el km/h real se
-// pone al corriente.
+// Indicador instantáneo de movimiento a partir de acelerómetro Y
+// giroscopio (no una velocidad — ninguno de los dos sirve para eso, ver
+// comentario arriba). Dos señales independientes, cada una con su propio
+// umbral e histéresis, combinadas con OR: cualquiera de las dos que
+// detecte actividad cuenta como "en movimiento" — un vehículo real
+// también rota (curvas, irregularidades), no solo acelera en línea recta.
+// Reacciona en el siguiente sample (~1 s), mucho más rápido que el GPS.
 const MOVEMENT_ENTER_G = 0.08;
 const MOVEMENT_EXIT_G = 0.03;
+const ROTATION_ENTER_RAD_S = 0.35;
+const ROTATION_EXIT_RAD_S = 0.15;
 
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
+}
+
+function gyroMagnitude(g: GyroscopeMeasurement): number {
+  return Math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
 }
 
 /** Distancia entre dos coordenadas (fórmula de Haversine), en metros. */
@@ -97,6 +104,8 @@ export default function NodoScreen() {
   const [isMoving, setIsMoving] = useState(false);
   const isMovingRef = useRef(false);
   const movementEmaRef = useRef(0);
+  const [gyroAvailable, setGyroAvailable] = useState<boolean | null>(null);
+  const rotationEmaRef = useRef(0);
   // Puente hacia el poll() del efecto de GPS (más abajo), para poder
   // pedirle una lectura anticipada al detectar un jaloneo fuerte, sin
   // esperar el intervalo programado. Ver MOVEMENT_ENTER_G más abajo.
@@ -114,9 +123,38 @@ export default function NodoScreen() {
     setLog((prev) => [`${new Date().toLocaleTimeString()}  ${line}`, ...prev].slice(0, 8));
   }
 
-  // Disponibilidad del sensor (se checa una vez).
+  // Combina acelerómetro + giroscopio (OR, cada uno con su histéresis) en
+  // el indicador "en movimiento", y mientras haya movimiento le pide al
+  // GPS una lectura fresca (máx. una cada 1.5s, no solo al arrancar) —
+  // así el km/h real se pone al corriente más rápido, sin inventar ningún
+  // valor de por medio.
+  function evaluateMovement() {
+    const accelCrossed = isMovingRef.current
+      ? movementEmaRef.current > MOVEMENT_EXIT_G
+      : movementEmaRef.current > MOVEMENT_ENTER_G;
+    const rotationCrossed = isMovingRef.current
+      ? rotationEmaRef.current > ROTATION_EXIT_RAD_S
+      : rotationEmaRef.current > ROTATION_ENTER_RAD_S;
+    const nextIsMoving = accelCrossed || rotationCrossed;
+
+    if (nextIsMoving !== isMovingRef.current) {
+      isMovingRef.current = nextIsMoving;
+      setIsMoving(nextIsMoving);
+    }
+
+    if (nextIsMoving) {
+      const now = Date.now();
+      if (now - lastTriggeredPollAtRef.current > 1500) {
+        lastTriggeredPollAtRef.current = now;
+        triggerGpsPollRef.current?.();
+      }
+    }
+  }
+
+  // Disponibilidad de los sensores (se checa una vez).
   useEffect(() => {
     Accelerometer.isAvailableAsync().then(setAccelAvailable);
+    Gyroscope.isAvailableAsync().then(setGyroAvailable);
   }, []);
 
   // Suscripción al acelerómetro real. readingRef siempre tiene el último
@@ -128,28 +166,20 @@ export default function NodoScreen() {
     const sub = Accelerometer.addListener((m) => {
       readingRef.current = m;
       setReading(m);
+      movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
+      evaluateMovement();
+    });
+    return () => sub.remove();
+  }, [samplingMs]);
 
-      const deviation = Math.abs(magnitude(m) - 1);
-      movementEmaRef.current = movementEmaRef.current * 0.7 + deviation * 0.3;
-      const nextIsMoving = isMovingRef.current
-        ? movementEmaRef.current > MOVEMENT_EXIT_G
-        : movementEmaRef.current > MOVEMENT_ENTER_G;
-      if (nextIsMoving !== isMovingRef.current) {
-        isMovingRef.current = nextIsMoving;
-        setIsMoving(nextIsMoving);
-
-        // Arranque de movimiento detectado: no esperar al siguiente tick
-        // programado del GPS, pedir una lectura ya — así el km/h real se
-        // pone al corriente más rápido tras un cambio real, sin inventar
-        // ningún valor de por medio. No dispara al SALIR de movimiento
-        // (frenar gradual no es tan urgente de confirmar) ni más seguido
-        // que cada 1.5s (evita machacar el GPS con jaloneo sostenido).
-        const now = Date.now();
-        if (nextIsMoving && now - lastTriggeredPollAtRef.current > 1500) {
-          lastTriggeredPollAtRef.current = now;
-          triggerGpsPollRef.current?.();
-        }
-      }
+  // Suscripción al giroscopio real — misma frecuencia que el acelerómetro,
+  // solo alimenta el indicador de movimiento (ver evaluateMovement).
+  useEffect(() => {
+    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    Gyroscope.setUpdateInterval(intervalMs);
+    const sub = Gyroscope.addListener((g) => {
+      rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
+      evaluateMovement();
     });
     return () => sub.remove();
   }, [samplingMs]);
@@ -362,7 +392,7 @@ export default function NodoScreen() {
       />
       <Text style={[styles.movementBadge, { color: isMoving ? '#0ca30c' : '#898781' }]}>
         {isMoving ? '● en movimiento' : '○ quieto'}
-        <Text style={styles.movementHint}> (del acelerómetro, no es velocidad)</Text>
+        <Text style={styles.movementHint}> (acelerómetro + giroscopio, no es velocidad)</Text>
       </Text>
       <TextInput
         style={styles.input}
