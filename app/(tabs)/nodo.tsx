@@ -5,8 +5,10 @@ import {
   Barometer,
   Gyroscope,
   LightSensor,
+  Magnetometer,
   type AccelerometerMeasurement,
   type GyroscopeMeasurement,
+  type MagnetometerMeasurement,
 } from 'expo-sensors';
 import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
@@ -16,6 +18,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { Text, View } from '@/components/Themed';
 import SpeedGauge from '@/src/components/SpeedGauge';
+import { CONTRACT_VERSION } from '@/src/contract/contract';
 
 // Modo Nodo: conecta al broker de sit-ciit-infra y publica lecturas reales
 // del acelerómetro y del GPS del celular como mensajes `telemetry` del
@@ -184,6 +187,12 @@ export default function NodoScreen() {
   const [pressureHpa, setPressureHpa] = useState<number | null>(null);
   const pressureRef = useRef<number | null>(null);
 
+  // Magnetómetro (µT) — lectura cruda dentro de telemetry (contrato v1.1.0),
+  // no un rumbo/brújula.
+  const [magAvailable, setMagAvailable] = useState<boolean | null>(null);
+  const [magReading, setMagReading] = useState<MagnetometerMeasurement | null>(null);
+  const magRef = useRef<MagnetometerMeasurement | null>(null);
+
   // Puente hacia el poll() del efecto de GPS (más abajo), para poder
   // pedirle una lectura anticipada al detectar un jaloneo fuerte, sin
   // esperar el intervalo programado. Ver MOVEMENT_ENTER_G más abajo.
@@ -211,6 +220,7 @@ export default function NodoScreen() {
   const capabilities = [
     accelAvailable ? 'accelerometer' : null,
     gyroAvailable ? 'gyroscope' : null,
+    magAvailable ? 'magnetometer' : null,
     locationPermission === 'granted' ? 'gps' : null,
     lightAvailable ? 'light' : null,
     barometerAvailable ? 'barometer' : null,
@@ -265,7 +275,7 @@ export default function NodoScreen() {
     seqRef.current += 1;
     const g = gpsRef.current;
     const payload = JSON.stringify({
-      contractVersion: '1.0.0',
+      contractVersion: CONTRACT_VERSION,
       msgId: uuidv4(),
       nodeId,
       unitId,
@@ -292,6 +302,7 @@ export default function NodoScreen() {
     Gyroscope.isAvailableAsync().then(setGyroAvailable);
     LightSensor.isAvailableAsync().then(setLightAvailable);
     Barometer.isAvailableAsync().then(setBarometerAvailable);
+    Magnetometer.isAvailableAsync().then(setMagAvailable);
   }, []);
 
   // Suscripción al acelerómetro real. readingRef siempre tiene el último
@@ -405,6 +416,18 @@ export default function NodoScreen() {
     const sub = Barometer.addListener(({ pressure }) => {
       pressureRef.current = pressure;
       setPressureHpa(pressure);
+    });
+    return () => sub.remove();
+  }, [samplingMs]);
+
+  // Suscripción al magnetómetro real — lectura cruda en µT (contrato v1.1.0),
+  // no un rumbo/brújula.
+  useEffect(() => {
+    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    Magnetometer.setUpdateInterval(intervalMs);
+    const sub = Magnetometer.addListener((m) => {
+      magRef.current = m;
+      setMagReading(m);
     });
     return () => sub.remove();
   }, [samplingMs]);
@@ -547,7 +570,7 @@ export default function NodoScreen() {
     seqRef.current += 1;
     const g = gpsRef.current;
     const payload = JSON.stringify({
-      contractVersion: '1.0.0',
+      contractVersion: CONTRACT_VERSION,
       msgId: uuidv4(),
       nodeId,
       unitId,
@@ -556,6 +579,15 @@ export default function NodoScreen() {
       ts: Date.now(),
       type: 'telemetry',
       accel: { x: m.x, y: m.y, z: m.z },
+      ...(magRef.current
+        ? {
+            mag: {
+              x: magRef.current.x,
+              y: magRef.current.y,
+              z: magRef.current.z,
+            },
+          }
+        : {}),
       ...(lux != null ? { lux } : {}),
       ...(pressureRef.current != null ? { pressureHpa: pressureRef.current } : {}),
       ...(g
@@ -595,7 +627,7 @@ export default function NodoScreen() {
     seqRef.current += 1;
     const level = batteryLevelRef.current;
     const payload = JSON.stringify({
-      contractVersion: '1.0.0',
+      contractVersion: CONTRACT_VERSION,
       msgId: uuidv4(),
       nodeId,
       unitId,
@@ -749,6 +781,10 @@ export default function NodoScreen() {
 
       <Text style={styles.reading}>
         Presión: {barometerAvailable === false ? 'no disponible en este dispositivo' : pressureHpa != null ? `${pressureHpa.toFixed(1)} hPa` : 'esperando...'}
+      </Text>
+
+      <Text style={styles.reading}>
+        Magnetómetro: {magAvailable === false ? 'no disponible en este dispositivo' : magReading != null ? `x=${magReading.x.toFixed(1)}  y=${magReading.y.toFixed(1)}  z=${magReading.z.toFixed(1)} µT` : 'esperando...'}
       </Text>
 
       <Text style={styles.status}>Estado: {status}</Text>
