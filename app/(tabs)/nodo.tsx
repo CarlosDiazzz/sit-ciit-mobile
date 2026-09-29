@@ -28,6 +28,8 @@ interface GpsReading {
   accuracyM: number | null;
   /** Solo para mostrar en pantalla — no se manda por MQTT. */
   speedSource: 'gps' | 'posicion' | null;
+  /** Hora real de esta posición (loc.timestamp), para ver si está vieja. */
+  fixTimestamp: number;
 }
 
 const DEFAULT_SAMPLING_MS = 1000;
@@ -128,9 +130,20 @@ export default function NodoScreen() {
 
       const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
       subscription = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: intervalMs, distanceInterval: 0 },
+        // High en vez de BestForNavigation: BestForNavigation espera un
+        // fix multi-satélite más completo (más preciso pero más lento a
+        // responder); en interiores/demo priorizamos frecuencia de
+        // actualización sobre precisión centimétrica.
+        { accuracy: Location.Accuracy.High, timeInterval: intervalMs, distanceInterval: 0 },
         (loc) => {
           const { latitude: lat, longitude: lon, speed, accuracy } = loc.coords;
+
+          // Si el proveedor repite el mismo fix (timestamp sin avanzar),
+          // no es una medición nueva — no recalcular con eso, se
+          // conserva la última velocidad válida conocida en vez de
+          // "parpadear" a un valor calculado con tiempo ~0.
+          if (lastFix && loc.timestamp === lastFix.timestamp) return;
+
           let speedMs: number | null = speed != null && speed >= 0 ? speed : null;
           let speedSource: GpsReading['speedSource'] = speedMs != null ? 'gps' : null;
 
@@ -146,7 +159,14 @@ export default function NodoScreen() {
 
           lastFix = { lat, lon, accuracyM: accuracy ?? 0, timestamp: loc.timestamp };
 
-          const value: GpsReading = { lat, lon, speedMs, accuracyM: accuracy, speedSource };
+          const value: GpsReading = {
+            lat,
+            lon,
+            speedMs,
+            accuracyM: accuracy,
+            speedSource,
+            fixTimestamp: loc.timestamp,
+          };
           gpsRef.current = value;
           setGps(value);
         }
@@ -262,7 +282,7 @@ export default function NodoScreen() {
             : gps
               ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
                 `${gps.speedSource === 'posicion' ? ' (estimada por posición)' : ''}` +
-                `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m)`
+                `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m, fix ${new Date(gps.fixTimestamp).toLocaleTimeString()})`
               : 'Esperando fix de GPS...'}
       </Text>
 
