@@ -1,19 +1,32 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, StyleSheet, Switch, TextInput } from 'react-native';
 import { Accelerometer, type AccelerometerMeasurement } from 'expo-sensors';
+import * as Location from 'expo-location';
 import mqtt, { type MqttClient } from 'mqtt';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Text, View } from '@/components/Themed';
 
 // Modo Nodo: conecta al broker de sit-ciit-infra y publica lecturas reales
-// del acelerómetro del celular como mensajes `telemetry` del contrato.
-// Pendiente para fases siguientes: GPS/luz/presión, detección de eventos
-// en el borde (Fase 2), outbox SQLite (Fase 3), pantalla de configuración
+// del acelerómetro y del GPS del celular como mensajes `telemetry` del
+// contrato. La velocidad (km/h) se calcula en el dashboard a partir de
+// gps.speedMs — el GPS es la única fuente confiable de velocidad; el
+// acelerómetro NO se usa para eso (integrarlo dos veces para obtener
+// velocidad acumula error / deriva muy rápido y daría un número falso).
+// Pendiente para fases siguientes: luz/presión, detección de eventos en
+// el borde (Fase 2), outbox SQLite (Fase 3), pantalla de configuración
 // persistente y manejo de comandos (Fase 4).
 
 type Status = 'idle' | 'connecting' | 'connected' | 'error';
 type NodeRole = 'primary' | 'backup';
+type LocationPermission = 'unknown' | 'granted' | 'denied';
+
+interface GpsReading {
+  lat: number;
+  lon: number;
+  speedMs: number | null;
+  accuracyM: number | null;
+}
 
 const DEFAULT_SAMPLING_MS = 1000;
 
@@ -45,6 +58,11 @@ export default function NodoScreen() {
   const [samplingMs, setSamplingMs] = useState(String(DEFAULT_SAMPLING_MS));
   const [autoPublish, setAutoPublish] = useState(false);
 
+  // GPS (única fuente de velocidad — ver comentario arriba)
+  const [locationPermission, setLocationPermission] = useState<LocationPermission>('unknown');
+  const [gps, setGps] = useState<GpsReading | null>(null);
+  const gpsRef = useRef<GpsReading | null>(null);
+
   const [log, setLog] = useState<string[]>([]);
   function appendLog(line: string) {
     setLog((prev) => [`${new Date().toLocaleTimeString()}  ${line}`, ...prev].slice(0, 8));
@@ -66,6 +84,41 @@ export default function NodoScreen() {
       setReading(m);
     });
     return () => sub.remove();
+  }, [samplingMs]);
+
+  // Permiso + suscripción al GPS real. speed/accuracy pueden llegar en
+  // null hasta que el dispositivo consigue un "fix" (normal en interiores
+  // o los primeros segundos al aire libre).
+  useEffect(() => {
+    let subscription: Location.LocationSubscription | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (cancelled) return;
+      setLocationPermission(status === 'granted' ? 'granted' : 'denied');
+      if (status !== 'granted') return;
+
+      const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+      subscription = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: intervalMs, distanceInterval: 0 },
+        (loc) => {
+          const value: GpsReading = {
+            lat: loc.coords.latitude,
+            lon: loc.coords.longitude,
+            speedMs: loc.coords.speed,
+            accuracyM: loc.coords.accuracy,
+          };
+          gpsRef.current = value;
+          setGps(value);
+        }
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+      subscription?.remove();
+    };
   }, [samplingMs]);
 
   function connect() {
@@ -108,6 +161,7 @@ export default function NodoScreen() {
     if (!client || status !== 'connected' || !m) return;
 
     seqRef.current += 1;
+    const g = gpsRef.current;
     const payload = JSON.stringify({
       contractVersion: '1.0.0',
       msgId: uuidv4(),
@@ -118,6 +172,16 @@ export default function NodoScreen() {
       ts: Date.now(),
       type: 'telemetry',
       accel: { x: m.x, y: m.y, z: m.z },
+      ...(g
+        ? {
+            gps: {
+              lat: g.lat,
+              lon: g.lon,
+              ...(g.speedMs != null ? { speedMs: g.speedMs } : {}),
+              ...(g.accuracyM != null ? { accuracyM: g.accuracyM } : {}),
+            },
+          }
+        : {}),
     });
 
     client.publish(`sitciit/${nodeId}/telemetry`, payload, { qos: 1 }, (err) => {
@@ -145,6 +209,18 @@ export default function NodoScreen() {
           : reading
             ? `x=${reading.x.toFixed(3)}  y=${reading.y.toFixed(3)}  z=${reading.z.toFixed(3)}  |g|=${magnitude(reading).toFixed(3)}`
             : 'Esperando lecturas...'}
+      </Text>
+
+      <Text style={styles.sectionLabel}>GPS (fuente de velocidad)</Text>
+      <Text style={styles.reading}>
+        {locationPermission === 'denied'
+          ? 'Permiso de ubicación denegado'
+          : locationPermission === 'unknown'
+            ? 'Pidiendo permiso...'
+            : gps
+              ? `${gps.speedMs != null ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
+                `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m)`
+              : 'Esperando fix de GPS...'}
       </Text>
 
       <Text style={styles.sectionLabel}>Identidad del nodo</Text>
