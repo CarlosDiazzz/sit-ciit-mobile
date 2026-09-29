@@ -1,14 +1,15 @@
 import { StyleSheet } from 'react-native';
 
-import EditScreenInfo from '@/components/EditScreenInfo';
 import { Text, View } from '@/components/Themed';
 
-export default function TabOneScreen() {
+// Modo Operador: login, alertas en vivo, trigger/stop alarm.
+// Implementación real desde la Fase 6 (ver CLAUDE.md del repo).
+export default function OperadorScreen() {
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Tab One</Text>
+      <Text style={styles.title}>Modo Operador</Text>
       <View style={styles.separator} lightColor="#eee" darkColor="rgba(255,255,255,0.1)" />
-      <EditScreenInfo path="app/(tabs)/index.tsx" />
+      <Text>Pendiente: login, alertas en vivo y control de alarma (Fase 6).</Text>
     </View>
   );
 }
@@ -18,6 +19,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    padding: 24,
   },
   title: {
     fontSize: 20,
