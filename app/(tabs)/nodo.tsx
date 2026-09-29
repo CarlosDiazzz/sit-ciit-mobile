@@ -36,6 +36,9 @@ interface GpsReading {
 
 const DEFAULT_SAMPLING_MS = 1000;
 const DEFAULT_GPS_INTERVAL_MS = 5000;
+// Piso fijo para distinguir "te moviste" de "ruido del GPS" — ver el
+// comentario junto a donde se usa (más abajo) para el porqué de bajarlo.
+const MIN_MOVEMENT_M = 3;
 
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
@@ -154,7 +157,17 @@ export default function NodoScreen() {
           const dtSec = (loc.timestamp - lastFix.timestamp) / 1000;
           if (dtSec > 0.2) {
             const distanceM = haversineMeters(lastFix, { lat, lon });
-            const noiseFloorM = Math.max(lastFix.accuracyM, accuracy ?? 0, 5);
+            // Antes este piso escalaba con accuracyM (~20-30 m en
+            // interiores) para nunca leer el propio ruido del GPS como
+            // movimiento — pero eso también tapaba movimiento REAL
+            // corriendo/caminando en interiores, porque a esa distancia
+            // de error, unos metros reales y ruido se ven igual. Se baja
+            // a un piso fijo chico: se vuelve más sensible a movimiento
+            // real, a costa de que parado también pueda "brincar" un
+            // poco por ruido del GPS — no hay forma de tener las dos
+            // cosas con ~20-30 m de precisión indoor; para algo
+            // realmente estable Y sensible hace falta cielo abierto.
+            const noiseFloorM = MIN_MOVEMENT_M;
             speedMs = distanceM < noiseFloorM ? 0 : distanceM / dtSec;
             speedSource = 'posicion';
           }
