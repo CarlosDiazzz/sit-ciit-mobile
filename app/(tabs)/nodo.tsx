@@ -97,6 +97,11 @@ export default function NodoScreen() {
   const [isMoving, setIsMoving] = useState(false);
   const isMovingRef = useRef(false);
   const movementEmaRef = useRef(0);
+  // Puente hacia el poll() del efecto de GPS (más abajo), para poder
+  // pedirle una lectura anticipada al detectar un jaloneo fuerte, sin
+  // esperar el intervalo programado. Ver MOVEMENT_ENTER_G más abajo.
+  const triggerGpsPollRef = useRef<(() => void) | null>(null);
+  const lastTriggeredPollAtRef = useRef(0);
 
   // GPS (única fuente de velocidad — ver comentario arriba)
   const [locationPermission, setLocationPermission] = useState<LocationPermission>('unknown');
@@ -132,6 +137,18 @@ export default function NodoScreen() {
       if (nextIsMoving !== isMovingRef.current) {
         isMovingRef.current = nextIsMoving;
         setIsMoving(nextIsMoving);
+
+        // Arranque de movimiento detectado: no esperar al siguiente tick
+        // programado del GPS, pedir una lectura ya — así el km/h real se
+        // pone al corriente más rápido tras un cambio real, sin inventar
+        // ningún valor de por medio. No dispara al SALIR de movimiento
+        // (frenar gradual no es tan urgente de confirmar) ni más seguido
+        // que cada 1.5s (evita machacar el GPS con jaloneo sostenido).
+        const now = Date.now();
+        if (nextIsMoving && now - lastTriggeredPollAtRef.current > 1500) {
+          lastTriggeredPollAtRef.current = now;
+          triggerGpsPollRef.current?.();
+        }
       }
     });
     return () => sub.remove();
@@ -223,11 +240,13 @@ export default function NodoScreen() {
       const intervalMs = Number(gpsIntervalMs) || DEFAULT_GPS_INTERVAL_MS;
       poll();
       timer = setInterval(poll, intervalMs);
+      triggerGpsPollRef.current = poll;
     })();
 
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
+      triggerGpsPollRef.current = null;
     };
   }, [gpsIntervalMs]);
 
