@@ -3,6 +3,7 @@ import { Button, ScrollView, StyleSheet, Switch, TextInput } from 'react-native'
 import { Accelerometer, Gyroscope, type AccelerometerMeasurement, type GyroscopeMeasurement } from 'expo-sensors';
 import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
+import { useBatteryLevel } from 'expo-battery';
 import mqtt, { type MqttClient } from 'mqtt';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -22,6 +23,7 @@ import SpeedGauge from '@/src/components/SpeedGauge';
 type Status = 'idle' | 'connecting' | 'connected' | 'error';
 type NodeRole = 'primary' | 'backup';
 type LocationPermission = 'unknown' | 'granted' | 'denied';
+type NodeMode = 'normal' | 'inspection' | 'alarm';
 
 interface GpsReading {
   lat: number;
@@ -36,6 +38,8 @@ interface GpsReading {
 
 const DEFAULT_SAMPLING_MS = 1000;
 const DEFAULT_GPS_INTERVAL_MS = 5000;
+// Fijo por contrato ("late cada 5 s"), no configurable como samplingMs.
+const HEARTBEAT_INTERVAL_MS = 5000;
 // Piso fijo para distinguir "te moviste" de "ruido del GPS" — ver el
 // comentario junto a donde se usa (más abajo) para el porqué de bajarlo.
 const MIN_MOVEMENT_M = 3;
@@ -122,6 +126,28 @@ export default function NodoScreen() {
   function appendLog(line: string) {
     setLog((prev) => [`${new Date().toLocaleTimeString()}  ${line}`, ...prev].slice(0, 8));
   }
+
+  // Heartbeat: batteryLevel de expo-battery ya es reactivo (0-1, -1 si el
+  // dispositivo no reporta). mode lo cambian los comandos (Fase 4); por
+  // ahora siempre "normal". pendingOutbox es 0 hasta que exista una cola
+  // real (Fase 3) — no hay outbox todavía, así que no hay nada pendiente
+  // que reportar honestamente.
+  const batteryLevel = useBatteryLevel();
+  const [mode] = useState<NodeMode>('normal');
+  const capabilities = [
+    accelAvailable ? 'accelerometer' : null,
+    gyroAvailable ? 'gyroscope' : null,
+    locationPermission === 'granted' ? 'gps' : null,
+  ].filter((c): c is string => c !== null);
+  // Cambian con cada sample de sensor (varias veces por segundo); leerlos
+  // por ref evita que el intervalo de heartbeat (más abajo) se reinicie
+  // en cada render — solo nodeId/unitId/role/status ameritan reiniciarlo.
+  const batteryLevelRef = useRef(batteryLevel);
+  batteryLevelRef.current = batteryLevel;
+  const capabilitiesRef = useRef(capabilities);
+  capabilitiesRef.current = capabilities;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
 
   // Combina acelerómetro + giroscopio (OR, cada uno con su histéresis) en
   // el indicador "en movimiento", y mientras haya movimiento le pide al
@@ -360,6 +386,49 @@ export default function NodoScreen() {
     const id = setInterval(publishTelemetry, intervalMs);
     return () => clearInterval(id);
   }, [autoPublish, status, samplingMs, nodeId, unitId, role]);
+
+  function publishHeartbeat() {
+    const client = clientRef.current;
+    if (!client || status !== 'connected') return;
+
+    seqRef.current += 1;
+    const level = batteryLevelRef.current;
+    const payload = JSON.stringify({
+      contractVersion: '1.0.0',
+      msgId: uuidv4(),
+      nodeId,
+      unitId,
+      role,
+      seq: seqRef.current,
+      ts: Date.now(),
+      type: 'heartbeat',
+      // getBatteryLevelAsync/useBatteryLevel devuelven -1 cuando el
+      // dispositivo no reporta nivel de batería (ver expo-battery) — el
+      // contrato no acepta negativos, así que se omite en vez de mandarlo.
+      ...(level != null && level >= 0 ? { batteryPct: Math.round(level * 100) } : {}),
+      pendingOutbox: 0, // no hay outbox todavía (Fase 3)
+      samplingMs: Number(samplingMs) || DEFAULT_SAMPLING_MS,
+      capabilities: capabilitiesRef.current,
+      mode: modeRef.current,
+    });
+
+    // Heartbeat no se registra en el log de UI (saldría uno cada 5s
+    // ahogando lo demás) — solo se avisa si falla.
+    client.publish(`sitciit/${nodeId}/heartbeat`, payload, { qos: 1 }, (err) => {
+      if (err) appendLog(`Fallo al publicar heartbeat: ${err.message}`);
+    });
+  }
+
+  // El heartbeat es independiente de "Publicar automáticamente": el nodo
+  // debe latir mientras esté conectado, publique telemetría o no (si no
+  // late, a los 15s el backend lo marca offline igual, aunque sí esté
+  // mandando datos... salvo telemetry, que hoy también actualiza
+  // is_online — pero el heartbeat es la señal formal del contrato).
+  useEffect(() => {
+    if (status !== 'connected') return;
+    const id = setInterval(publishHeartbeat, HEARTBEAT_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [status, nodeId, unitId, role]);
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>

@@ -7,6 +7,7 @@
     "buffer": "^6.0.3",
     "expo": "~57.0.26",
     "expo-av": "^16.0.8",
+    "expo-battery": "~57.0.3",
     "expo-constants": "~57.0.20",
     "expo-font": "~57.0.4",
     "expo-haptics": "~57.0.3",
