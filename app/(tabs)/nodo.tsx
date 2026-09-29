@@ -395,7 +395,7 @@ export default function NodoScreen() {
         <Text style={styles.movementHint}> (acelerómetro + giroscopio, no es velocidad)</Text>
       </Text>
       <TextInput
-        style={styles.input}
+        style={styles.input} placeholderTextColor="#999999"
         value={gpsIntervalMs}
         onChangeText={setGpsIntervalMs}
         keyboardType="numeric"
@@ -403,17 +403,17 @@ export default function NodoScreen() {
       />
 
       <Text style={styles.sectionLabel}>Identidad del nodo</Text>
-      <TextInput style={styles.input} value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
-      <TextInput style={styles.input} value={unitId} onChangeText={setUnitId} placeholder="unitId" autoCapitalize="none" />
+      <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
+      <TextInput style={styles.input} placeholderTextColor="#999999" value={unitId} onChangeText={setUnitId} placeholder="unitId" autoCapitalize="none" />
       <View style={styles.row}>
         <Text>Rol: {role}</Text>
         <Switch value={isBackup} onValueChange={setIsBackup} />
       </View>
 
       <Text style={styles.sectionLabel}>Conexión MQTT</Text>
-      <TextInput style={styles.input} value={brokerUrl} onChangeText={setBrokerUrl} placeholder="ws://<ip>:9001" autoCapitalize="none" />
-      <TextInput style={styles.input} value={username} onChangeText={setUsername} placeholder="usuario" autoCapitalize="none" />
-      <TextInput style={styles.input} value={password} onChangeText={setPassword} placeholder="contraseña" secureTextEntry autoCapitalize="none" />
+      <TextInput style={styles.input} placeholderTextColor="#999999" value={brokerUrl} onChangeText={setBrokerUrl} placeholder="ws://<ip>:9001" autoCapitalize="none" />
+      <TextInput style={styles.input} placeholderTextColor="#999999" value={username} onChangeText={setUsername} placeholder="usuario" autoCapitalize="none" />
+      <TextInput style={styles.input} placeholderTextColor="#999999" value={password} onChangeText={setPassword} placeholder="contraseña" secureTextEntry autoCapitalize="none" />
 
       <Button title="Conectar" onPress={connect} disabled={status === 'connecting'} />
       <View style={styles.spacer} />
@@ -421,7 +421,7 @@ export default function NodoScreen() {
 
       <Text style={styles.sectionLabel}>Muestreo</Text>
       <TextInput
-        style={styles.input}
+        style={styles.input} placeholderTextColor="#999999"
         value={samplingMs}
         onChangeText={setSamplingMs}
         keyboardType="numeric"
@@ -445,16 +445,17 @@ export default function NodoScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  // Colores explicitos: no depender del tema del sistema (ver app/_layout.tsx).
+  container: { flex: 1, backgroundColor: '#ffffff' },
   scrollContent: { padding: 16, paddingTop: 50, paddingBottom: 60 },
-  title: { fontSize: 18, fontWeight: 'bold', marginBottom: 8 },
-  sectionLabel: { fontSize: 13, fontWeight: '600', opacity: 0.7, marginTop: 12, marginBottom: 4 },
-  reading: { fontVariant: ['tabular-nums'], fontSize: 14 },
-  input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, marginBottom: 6 },
+  title: { fontSize: 18, fontWeight: 'bold', marginBottom: 8, color: '#111111' },
+  sectionLabel: { fontSize: 13, fontWeight: '600', marginTop: 12, marginBottom: 4, color: '#555555' },
+  reading: { fontVariant: ['tabular-nums'], fontSize: 14, color: '#111111' },
+  input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, marginBottom: 6, color: '#111111', backgroundColor: '#ffffff' },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   spacer: { height: 8 },
   movementBadge: { textAlign: 'center', fontWeight: '700', fontSize: 13, marginBottom: 8 },
   movementHint: { fontWeight: '400', opacity: 0.6, fontSize: 11 },
-  status: { marginTop: 16, fontWeight: '600' },
-  logLine: { fontSize: 11, opacity: 0.7 },
+  status: { marginTop: 16, fontWeight: '600', color: '#111111' },
+  logLine: { fontSize: 11, color: '#666666' },
 });

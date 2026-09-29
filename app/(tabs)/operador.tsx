@@ -20,10 +20,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     padding: 24,
+    backgroundColor: '#ffffff',
   },
   title: {
     fontSize: 20,
     fontWeight: 'bold',
+    color: '#111111',
   },
   separator: {
     marginVertical: 30,
