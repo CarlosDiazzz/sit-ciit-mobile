@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, ScrollView, StyleSheet, Switch, TextInput } from 'react-native';
-import { Accelerometer, Gyroscope, type AccelerometerMeasurement, type GyroscopeMeasurement } from 'expo-sensors';
+import {
+  Accelerometer,
+  Barometer,
+  Gyroscope,
+  LightSensor,
+  type AccelerometerMeasurement,
+  type GyroscopeMeasurement,
+} from 'expo-sensors';
 import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
 import { useBatteryLevel } from 'expo-battery';
@@ -68,6 +75,14 @@ const DEFAULT_IMPACT_THRESHOLD_G = 2.5;
 const IMPACT_CRITICAL_MULTIPLIER = 1.5;
 const ROLLOVER_ANGLE_DEG = 60;
 const ROLLOVER_SUSTAIN_MS = 2000;
+
+// door_open/door_closed (sensor de luz, Android-only). Histéresis: entre
+// los dos umbrales no se decide nada (evita parpadear justo en el borde
+// de una sombra pasajera); debounce de 1s: el candidato debe sostenerse
+// ese tiempo antes de confirmarse como cambio real.
+const DEFAULT_DOOR_OPEN_LUX = 50;
+const DEFAULT_DOOR_CLOSED_LUX = 10;
+const DOOR_DEBOUNCE_MS = 1000;
 
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
@@ -150,6 +165,25 @@ export default function NodoScreen() {
   const rolloverSinceRef = useRef<number | null>(null);
   const rolloverFiredRef = useRef(false);
   const [lastRolloverAngle, setLastRolloverAngle] = useState<number | null>(null);
+
+  // Luz (puerta) — Android-only, ver LightSensor de expo-sensors.
+  const [lightAvailable, setLightAvailable] = useState<boolean | null>(null);
+  const [lux, setLux] = useState<number | null>(null);
+  const [doorOpenLux, setDoorOpenLux] = useState(String(DEFAULT_DOOR_OPEN_LUX));
+  const [doorClosedLux, setDoorClosedLux] = useState(String(DEFAULT_DOOR_CLOSED_LUX));
+  // null = todavía no se determina un estado inicial (no se publica nada
+  // hasta la primera confirmación, para no mandar un "door_open" fantasma
+  // solo por haber arrancado la app con el celular ya destapado).
+  const doorStateRef = useRef<'open' | 'closed' | null>(null);
+  const doorPendingStateRef = useRef<'open' | 'closed' | null>(null);
+  const doorPendingSinceRef = useRef<number | null>(null);
+
+  // Presión (barómetro) — se manda dentro de telemetry, no genera eventos
+  // propios; no todos los modelos lo traen.
+  const [barometerAvailable, setBarometerAvailable] = useState<boolean | null>(null);
+  const [pressureHpa, setPressureHpa] = useState<number | null>(null);
+  const pressureRef = useRef<number | null>(null);
+
   // Puente hacia el poll() del efecto de GPS (más abajo), para poder
   // pedirle una lectura anticipada al detectar un jaloneo fuerte, sin
   // esperar el intervalo programado. Ver MOVEMENT_ENTER_G más abajo.
@@ -178,6 +212,8 @@ export default function NodoScreen() {
     accelAvailable ? 'accelerometer' : null,
     gyroAvailable ? 'gyroscope' : null,
     locationPermission === 'granted' ? 'gps' : null,
+    lightAvailable ? 'light' : null,
+    barometerAvailable ? 'barometer' : null,
   ].filter((c): c is string => c !== null);
   // Cambian con cada sample de sensor (varias veces por segundo); leerlos
   // por ref evita que el intervalo de heartbeat (más abajo) se reinicie
@@ -254,6 +290,8 @@ export default function NodoScreen() {
   useEffect(() => {
     Accelerometer.isAvailableAsync().then(setAccelAvailable);
     Gyroscope.isAvailableAsync().then(setGyroAvailable);
+    LightSensor.isAvailableAsync().then(setLightAvailable);
+    Barometer.isAvailableAsync().then(setBarometerAvailable);
   }, []);
 
   // Suscripción al acelerómetro real. readingRef siempre tiene el último
@@ -320,6 +358,53 @@ export default function NodoScreen() {
     const sub = Gyroscope.addListener((g) => {
       rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
       evaluateMovement();
+    });
+    return () => sub.remove();
+  }, [samplingMs]);
+
+  // Suscripción a luz real — detecta apertura/cierre de la caja con
+  // histéresis (zona muerta entre los dos umbrales) + debounce (el
+  // candidato debe sostenerse DOOR_DEBOUNCE_MS antes de confirmarse).
+  // La primera lectura solo calibra el estado inicial, no publica evento
+  // (no hay "cambio" real todavía, solo se está enterando de cómo empezó).
+  useEffect(() => {
+    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    LightSensor.setUpdateInterval(intervalMs);
+    const sub = LightSensor.addListener(({ illuminance }) => {
+      setLux(illuminance);
+
+      const openThreshold = Number(doorOpenLux) || DEFAULT_DOOR_OPEN_LUX;
+      const closedThreshold = Number(doorClosedLux) || DEFAULT_DOOR_CLOSED_LUX;
+      const candidate: 'open' | 'closed' | null =
+        illuminance > openThreshold ? 'open' : illuminance < closedThreshold ? 'closed' : null;
+      if (candidate === null) return; // en la banda de histéresis, no decide nada
+
+      if (candidate !== doorPendingStateRef.current) {
+        doorPendingStateRef.current = candidate;
+        doorPendingSinceRef.current = Date.now();
+        return;
+      }
+
+      const elapsed = Date.now() - (doorPendingSinceRef.current ?? Date.now());
+      if (elapsed < DOOR_DEBOUNCE_MS || candidate === doorStateRef.current) return;
+
+      const eraElConocido = doorStateRef.current !== null;
+      doorStateRef.current = candidate;
+      if (eraElConocido) {
+        publishEvent(candidate === 'open' ? 'door_open' : 'door_closed', candidate === 'open' ? 'warning' : 'info', illuminance);
+      }
+    });
+    return () => sub.remove();
+  }, [samplingMs, status, nodeId, unitId, role, doorOpenLux, doorClosedLux]);
+
+  // Suscripción al barómetro real — solo enriquece telemetry (pressureHpa),
+  // no genera eventos propios.
+  useEffect(() => {
+    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    Barometer.setUpdateInterval(intervalMs);
+    const sub = Barometer.addListener(({ pressure }) => {
+      pressureRef.current = pressure;
+      setPressureHpa(pressure);
     });
     return () => sub.remove();
   }, [samplingMs]);
@@ -471,6 +556,8 @@ export default function NodoScreen() {
       ts: Date.now(),
       type: 'telemetry',
       accel: { x: m.x, y: m.y, z: m.z },
+      ...(lux != null ? { lux } : {}),
+      ...(pressureRef.current != null ? { pressureHpa: pressureRef.current } : {}),
       ...(g
         ? {
             gps: {
@@ -639,6 +726,31 @@ export default function NodoScreen() {
         }}
       />
 
+      <Text style={styles.reading}>
+        Luz: {lightAvailable === false ? 'no disponible en este dispositivo' : lux != null ? `${lux.toFixed(0)} lx` : 'esperando...'}
+        {'  '}puerta: {doorStateRef.current ?? '¿?'}
+      </Text>
+      <View style={styles.row}>
+        <TextInput
+          style={[styles.input, styles.halfInput]} placeholderTextColor="#999999"
+          value={doorOpenLux}
+          onChangeText={setDoorOpenLux}
+          keyboardType="numeric"
+          placeholder="lux: abierta arriba de"
+        />
+        <TextInput
+          style={[styles.input, styles.halfInput]} placeholderTextColor="#999999"
+          value={doorClosedLux}
+          onChangeText={setDoorClosedLux}
+          keyboardType="numeric"
+          placeholder="lux: cerrada abajo de"
+        />
+      </View>
+
+      <Text style={styles.reading}>
+        Presión: {barometerAvailable === false ? 'no disponible en este dispositivo' : pressureHpa != null ? `${pressureHpa.toFixed(1)} hPa` : 'esperando...'}
+      </Text>
+
       <Text style={styles.status}>Estado: {status}</Text>
       {log.map((line, i) => (
         <Text key={i} style={styles.logLine}>
@@ -657,6 +769,7 @@ const styles = StyleSheet.create({
   sectionLabel: { fontSize: 13, fontWeight: '600', marginTop: 12, marginBottom: 4, color: '#555555' },
   reading: { fontVariant: ['tabular-nums'], fontSize: 14, color: '#111111' },
   input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, marginBottom: 6, color: '#111111', backgroundColor: '#ffffff' },
+  halfInput: { flex: 1, marginRight: 6 },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   spacer: { height: 8 },
   movementBadge: { textAlign: 'center', fontWeight: '700', fontSize: 13, marginBottom: 8 },
