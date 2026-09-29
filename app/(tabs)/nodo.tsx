@@ -26,12 +26,26 @@ interface GpsReading {
   lon: number;
   speedMs: number | null;
   accuracyM: number | null;
+  /** Solo para mostrar en pantalla — no se manda por MQTT. */
+  speedSource: 'gps' | 'posicion' | null;
 }
 
 const DEFAULT_SAMPLING_MS = 1000;
 
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
+}
+
+/** Distancia entre dos coordenadas (fórmula de Haversine), en metros. */
+function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const R = 6371000;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 export default function NodoScreen() {
@@ -89,9 +103,22 @@ export default function NodoScreen() {
   // Permiso + suscripción al GPS real. speed/accuracy pueden llegar en
   // null hasta que el dispositivo consigue un "fix" (normal en interiores
   // o los primeros segundos al aire libre).
+  //
+  // Respaldo cuando el proveedor no da speed confiable (Android manda -1,
+  // frecuente en interiores o con fix por red/WiFi en vez de satélites):
+  // se calcula la velocidad como distancia real entre dos posiciones GPS
+  // consecutivas / tiempo transcurrido. Esto SÍ es válido (a diferencia de
+  // integrar el acelerómetro): la distancia sale de una medición real de
+  // posición con un error acotado por la precisión del GPS, no de una
+  // integral que se dispara sin límite. Si el desplazamiento es menor que
+  // la precisión reportada, se cuenta como "sin movimiento medible" (0
+  // km/h) en vez de convertir el propio ruido del GPS en una velocidad
+  // falsa — con ~20 m de precisión en interiores, dos fixes que "saltan"
+  // 15 m en 1 s darían 54 km/h estando quieto si no se filtrara esto.
   useEffect(() => {
     let subscription: Location.LocationSubscription | null = null;
     let cancelled = false;
+    let lastFix: { lat: number; lon: number; accuracyM: number; timestamp: number } | null = null;
 
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -103,12 +130,23 @@ export default function NodoScreen() {
       subscription = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.BestForNavigation, timeInterval: intervalMs, distanceInterval: 0 },
         (loc) => {
-          const value: GpsReading = {
-            lat: loc.coords.latitude,
-            lon: loc.coords.longitude,
-            speedMs: loc.coords.speed,
-            accuracyM: loc.coords.accuracy,
-          };
+          const { latitude: lat, longitude: lon, speed, accuracy } = loc.coords;
+          let speedMs: number | null = speed != null && speed >= 0 ? speed : null;
+          let speedSource: GpsReading['speedSource'] = speedMs != null ? 'gps' : null;
+
+          if (speedMs == null && lastFix) {
+            const dtSec = (loc.timestamp - lastFix.timestamp) / 1000;
+            if (dtSec > 0.2) {
+              const distanceM = haversineMeters(lastFix, { lat, lon });
+              const noiseFloorM = Math.max(lastFix.accuracyM, accuracy ?? 0, 5);
+              speedMs = distanceM < noiseFloorM ? 0 : distanceM / dtSec;
+              speedSource = 'posicion';
+            }
+          }
+
+          lastFix = { lat, lon, accuracyM: accuracy ?? 0, timestamp: loc.timestamp };
+
+          const value: GpsReading = { lat, lon, speedMs, accuracyM: accuracy, speedSource };
           gpsRef.current = value;
           setGps(value);
         }
@@ -223,6 +261,7 @@ export default function NodoScreen() {
             ? 'Pidiendo permiso...'
             : gps
               ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
+                `${gps.speedSource === 'posicion' ? ' (estimada por posición)' : ''}` +
                 `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m)`
               : 'Esperando fix de GPS...'}
       </Text>
