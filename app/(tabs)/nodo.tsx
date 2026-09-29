@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, StyleSheet, Switch, TextInput } from 'react-native';
+import { Button, ScrollView, StyleSheet, Switch, TextInput } from 'react-native';
 import { Accelerometer, type AccelerometerMeasurement } from 'expo-sensors';
 import * as Location from 'expo-location';
 import { useKeepAwake } from 'expo-keep-awake';
@@ -35,6 +35,7 @@ interface GpsReading {
 }
 
 const DEFAULT_SAMPLING_MS = 1000;
+const DEFAULT_GPS_INTERVAL_MS = 5000;
 
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
@@ -86,6 +87,7 @@ export default function NodoScreen() {
   const [locationPermission, setLocationPermission] = useState<LocationPermission>('unknown');
   const [gps, setGps] = useState<GpsReading | null>(null);
   const gpsRef = useRef<GpsReading | null>(null);
+  const [gpsIntervalMs, setGpsIntervalMs] = useState(String(DEFAULT_GPS_INTERVAL_MS));
 
   const [log, setLog] = useState<string[]>([]);
   function appendLog(line: string) {
@@ -110,9 +112,12 @@ export default function NodoScreen() {
     return () => sub.remove();
   }, [samplingMs]);
 
-  // Permiso + suscripción al GPS real. speed/accuracy pueden llegar en
-  // null hasta que el dispositivo consigue un "fix" (normal en interiores
-  // o los primeros segundos al aire libre).
+  // Permiso + lectura del GPS real, por *polling activo* en vez de
+  // watchPositionAsync: con watchPositionAsync es Android quien decide
+  // cuándo avisarnos (en interiores puede tardar 15-30+ s entre avisos,
+  // pase lo que pase con `timeInterval`, que ahí es solo una sugerencia).
+  // Preguntando nosotros cada gpsIntervalMs con getCurrentPositionAsync
+  // tenemos control real del ritmo (tope configurable, 5 s por defecto).
   //
   // Respaldo cuando el proveedor no da speed confiable (Android manda -1,
   // frecuente en interiores o con fix por red/WiFi en vez de satélites):
@@ -126,9 +131,53 @@ export default function NodoScreen() {
   // falsa — con ~20 m de precisión en interiores, dos fixes que "saltan"
   // 15 m en 1 s darían 54 km/h estando quieto si no se filtrara esto.
   useEffect(() => {
-    let subscription: Location.LocationSubscription | null = null;
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     let lastFix: { lat: number; lon: number; accuracyM: number; timestamp: number } | null = null;
+    let busy = false;
+
+    async function poll() {
+      if (busy) return; // no encimar una lectura sobre otra que sigue en curso
+      busy = true;
+      try {
+        // Balanced (~100 m) en vez de High/BestForNavigation: en
+        // interiores resuelve más rápido (puede apoyarse en red/WiFi),
+        // priorizando frecuencia de actualización sobre precisión.
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (cancelled) return;
+
+        const { latitude: lat, longitude: lon, speed, accuracy } = loc.coords;
+        let speedMs: number | null = speed != null && speed >= 0 ? speed : null;
+        let speedSource: GpsReading['speedSource'] = speedMs != null ? 'gps' : null;
+
+        if (speedMs == null && lastFix) {
+          const dtSec = (loc.timestamp - lastFix.timestamp) / 1000;
+          if (dtSec > 0.2) {
+            const distanceM = haversineMeters(lastFix, { lat, lon });
+            const noiseFloorM = Math.max(lastFix.accuracyM, accuracy ?? 0, 5);
+            speedMs = distanceM < noiseFloorM ? 0 : distanceM / dtSec;
+            speedSource = 'posicion';
+          }
+        }
+
+        lastFix = { lat, lon, accuracyM: accuracy ?? 0, timestamp: loc.timestamp };
+
+        const value: GpsReading = {
+          lat,
+          lon,
+          speedMs,
+          accuracyM: accuracy,
+          speedSource,
+          fixTimestamp: loc.timestamp,
+        };
+        gpsRef.current = value;
+        setGps(value);
+      } catch {
+        // una lectura fallida puntual no debe tumbar el ciclo de polling
+      } finally {
+        busy = false;
+      }
+    }
 
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -136,56 +185,16 @@ export default function NodoScreen() {
       setLocationPermission(status === 'granted' ? 'granted' : 'denied');
       if (status !== 'granted') return;
 
-      const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
-      subscription = await Location.watchPositionAsync(
-        // High en vez de BestForNavigation: BestForNavigation espera un
-        // fix multi-satélite más completo (más preciso pero más lento a
-        // responder); en interiores/demo priorizamos frecuencia de
-        // actualización sobre precisión centimétrica.
-        { accuracy: Location.Accuracy.High, timeInterval: intervalMs, distanceInterval: 0 },
-        (loc) => {
-          const { latitude: lat, longitude: lon, speed, accuracy } = loc.coords;
-
-          // Si el proveedor repite el mismo fix (timestamp sin avanzar),
-          // no es una medición nueva — no recalcular con eso, se
-          // conserva la última velocidad válida conocida en vez de
-          // "parpadear" a un valor calculado con tiempo ~0.
-          if (lastFix && loc.timestamp === lastFix.timestamp) return;
-
-          let speedMs: number | null = speed != null && speed >= 0 ? speed : null;
-          let speedSource: GpsReading['speedSource'] = speedMs != null ? 'gps' : null;
-
-          if (speedMs == null && lastFix) {
-            const dtSec = (loc.timestamp - lastFix.timestamp) / 1000;
-            if (dtSec > 0.2) {
-              const distanceM = haversineMeters(lastFix, { lat, lon });
-              const noiseFloorM = Math.max(lastFix.accuracyM, accuracy ?? 0, 5);
-              speedMs = distanceM < noiseFloorM ? 0 : distanceM / dtSec;
-              speedSource = 'posicion';
-            }
-          }
-
-          lastFix = { lat, lon, accuracyM: accuracy ?? 0, timestamp: loc.timestamp };
-
-          const value: GpsReading = {
-            lat,
-            lon,
-            speedMs,
-            accuracyM: accuracy,
-            speedSource,
-            fixTimestamp: loc.timestamp,
-          };
-          gpsRef.current = value;
-          setGps(value);
-        }
-      );
+      const intervalMs = Number(gpsIntervalMs) || DEFAULT_GPS_INTERVAL_MS;
+      poll();
+      timer = setInterval(poll, intervalMs);
     })();
 
     return () => {
       cancelled = true;
-      subscription?.remove();
+      if (timer) clearInterval(timer);
     };
-  }, [samplingMs]);
+  }, [gpsIntervalMs]);
 
   function connect() {
     clientRef.current?.end(true);
@@ -269,7 +278,7 @@ export default function NodoScreen() {
   }, [autoPublish, status, samplingMs, nodeId, unitId, role]);
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       <Text style={styles.title}>Modo Nodo</Text>
 
       <Text style={styles.sectionLabel}>Acelerómetro</Text>
@@ -296,6 +305,13 @@ export default function NodoScreen() {
       <SpeedGauge
         speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : null}
         label={gps?.speedSource === 'posicion' ? 'estimada' : undefined}
+      />
+      <TextInput
+        style={styles.input}
+        value={gpsIntervalMs}
+        onChangeText={setGpsIntervalMs}
+        keyboardType="numeric"
+        placeholder="ms entre lecturas de GPS (5000 = 5s)"
       />
 
       <Text style={styles.sectionLabel}>Identidad del nodo</Text>
@@ -336,12 +352,13 @@ export default function NodoScreen() {
           {line}
         </Text>
       ))}
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, paddingTop: 50 },
+  container: { flex: 1 },
+  scrollContent: { padding: 16, paddingTop: 50, paddingBottom: 60 },
   title: { fontSize: 18, fontWeight: 'bold', marginBottom: 8 },
   sectionLabel: { fontSize: 13, fontWeight: '600', opacity: 0.7, marginTop: 12, marginBottom: 4 },
   reading: { fontVariant: ['tabular-nums'], fontSize: 14 },
