@@ -40,6 +40,15 @@ const DEFAULT_GPS_INTERVAL_MS = 5000;
 // comentario junto a donde se usa (más abajo) para el porqué de bajarlo.
 const MIN_MOVEMENT_M = 3;
 
+// Indicador instantáneo de movimiento a partir del acelerómetro (no una
+// velocidad — el acelerómetro no sirve para eso, ver comentario arriba).
+// Solo dice "hay jaloneo distinto a estar quieto", con histéresis para no
+// parpadear justo en el umbral. Reacciona en el siguiente sample (~1 s),
+// mucho más rápido que el GPS, como complemento mientras el km/h real se
+// pone al corriente.
+const MOVEMENT_ENTER_G = 0.08;
+const MOVEMENT_EXIT_G = 0.03;
+
 function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
 }
@@ -85,6 +94,9 @@ export default function NodoScreen() {
   const readingRef = useRef<AccelerometerMeasurement | null>(null);
   const [samplingMs, setSamplingMs] = useState(String(DEFAULT_SAMPLING_MS));
   const [autoPublish, setAutoPublish] = useState(false);
+  const [isMoving, setIsMoving] = useState(false);
+  const isMovingRef = useRef(false);
+  const movementEmaRef = useRef(0);
 
   // GPS (única fuente de velocidad — ver comentario arriba)
   const [locationPermission, setLocationPermission] = useState<LocationPermission>('unknown');
@@ -111,6 +123,16 @@ export default function NodoScreen() {
     const sub = Accelerometer.addListener((m) => {
       readingRef.current = m;
       setReading(m);
+
+      const deviation = Math.abs(magnitude(m) - 1);
+      movementEmaRef.current = movementEmaRef.current * 0.7 + deviation * 0.3;
+      const nextIsMoving = isMovingRef.current
+        ? movementEmaRef.current > MOVEMENT_EXIT_G
+        : movementEmaRef.current > MOVEMENT_ENTER_G;
+      if (nextIsMoving !== isMovingRef.current) {
+        isMovingRef.current = nextIsMoving;
+        setIsMoving(nextIsMoving);
+      }
     });
     return () => sub.remove();
   }, [samplingMs]);
@@ -319,6 +341,10 @@ export default function NodoScreen() {
         speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : null}
         label={gps?.speedSource === 'posicion' ? 'estimada' : undefined}
       />
+      <Text style={[styles.movementBadge, { color: isMoving ? '#0ca30c' : '#898781' }]}>
+        {isMoving ? '● en movimiento' : '○ quieto'}
+        <Text style={styles.movementHint}> (del acelerómetro, no es velocidad)</Text>
+      </Text>
       <TextInput
         style={styles.input}
         value={gpsIntervalMs}
@@ -378,6 +404,8 @@ const styles = StyleSheet.create({
   input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, marginBottom: 6 },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   spacer: { height: 8 },
+  movementBadge: { textAlign: 'center', fontWeight: '700', fontSize: 13, marginBottom: 8 },
+  movementHint: { fontWeight: '400', opacity: 0.6, fontSize: 11 },
   status: { marginTop: 16, fontWeight: '600' },
   logLine: { fontSize: 11, opacity: 0.7 },
 });
