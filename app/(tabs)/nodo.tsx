@@ -2,10 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 import { Button, StyleSheet, Switch, TextInput } from 'react-native';
 import { Accelerometer, type AccelerometerMeasurement } from 'expo-sensors';
 import * as Location from 'expo-location';
+import { useKeepAwake } from 'expo-keep-awake';
 import mqtt, { type MqttClient } from 'mqtt';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Text, View } from '@/components/Themed';
+import SpeedGauge from '@/src/components/SpeedGauge';
 
 // Modo Nodo: conecta al broker de sit-ciit-infra y publica lecturas reales
 // del acelerómetro y del GPS del celular como mensajes `telemetry` del
@@ -51,6 +53,12 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
 }
 
 export default function NodoScreen() {
+  // Evita que la pantalla se apague: si el SO suspende la app, Android
+  // pausa los timers de JS (el setInterval de publicación, el watch del
+  // GPS) y todo se ve "trabado" hasta que la pantalla vuelve a encenderse
+  // — probablemente la causa real del lag reportado en ambas gráficas.
+  useKeepAwake();
+
   // Conexión
   const [brokerUrl, setBrokerUrl] = useState(
     process.env.EXPO_PUBLIC_DEFAULT_MQTT_URL ?? 'ws://192.168.1.100:9001'
@@ -285,6 +293,10 @@ export default function NodoScreen() {
                 `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m, fix ${new Date(gps.fixTimestamp).toLocaleTimeString()})`
               : 'Esperando fix de GPS...'}
       </Text>
+      <SpeedGauge
+        speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : null}
+        label={gps?.speedSource === 'posicion' ? 'estimada' : undefined}
+      />
 
       <Text style={styles.sectionLabel}>Identidad del nodo</Text>
       <TextInput style={styles.input} value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
