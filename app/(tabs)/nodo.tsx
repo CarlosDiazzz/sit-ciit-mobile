@@ -11,6 +11,7 @@ import {
   type MagnetometerMeasurement,
 } from 'expo-sensors';
 import * as Location from 'expo-location';
+import * as SecureStore from 'expo-secure-store';
 import { useKeepAwake } from 'expo-keep-awake';
 import { useBatteryLevel } from 'expo-battery';
 import mqtt, { type MqttClient } from 'mqtt';
@@ -66,6 +67,23 @@ interface GpsReading {
   speedSource: 'gps' | 'posicion' | 'inercial' | null;
   /** Hora real de esta posición (loc.timestamp), para ver si está vieja. */
   fixTimestamp: number;
+}
+
+// Config del nodo (identidad + credenciales) guardada cifrada en el
+// dispositivo (Keystore/Keychain vía expo-secure-store) — se pide una
+// sola vez, no en cada arranque. El secreto es lo que autentica al nodo
+// ante el backend (contrato v1.3.0); sin SecureStore quedaría en texto
+// plano, y es un secreto real, no una preferencia de UI.
+const NODE_CONFIG_KEY = 'sitciit.nodeConfig';
+
+interface NodeConfig {
+  brokerUrl: string;
+  username: string;
+  password: string;
+  nodeId: string;
+  unitId: string;
+  role: NodeRole;
+  nodeSecret: string;
 }
 
 const DEFAULT_SAMPLING_MS = 1000;
@@ -157,12 +175,59 @@ export default function NodoScreen() {
   const [status, setStatus] = useState<Status>('idle');
   const clientRef = useRef<MqttClient | null>(null);
 
-  // Identidad del nodo (contrato: nodeId, unitId, role)
+  // Identidad del nodo (contrato: nodeId, unitId, role, nodeSecret)
   const [nodeId, setNodeId] = useState('unit-01-a');
   const [unitId, setUnitId] = useState('unit-01');
   const [isBackup, setIsBackup] = useState(false);
   const role: NodeRole = isBackup ? 'backup' : 'primary';
+  const [nodeSecret, setNodeSecret] = useState('');
   const seqRef = useRef(0);
+
+  // null mientras se lee SecureStore; false = sin configurar (mostrar
+  // formulario); true = configurado (mostrar resumen + Reconfigurar).
+  const [configured, setConfigured] = useState<boolean | null>(null);
+
+  // Al montar: si ya se guardó una config antes, se conecta sola — sin
+  // esto habría que volver a escribir todo a mano en cada arranque, que
+  // es justo lo frágil que se quería evitar.
+  useEffect(() => {
+    (async () => {
+      const raw = await SecureStore.getItemAsync(NODE_CONFIG_KEY);
+      if (!raw) {
+        setConfigured(false);
+        return;
+      }
+      const cfg: NodeConfig = JSON.parse(raw);
+      setBrokerUrl(cfg.brokerUrl);
+      setUsername(cfg.username);
+      setPassword(cfg.password);
+      setNodeId(cfg.nodeId);
+      setUnitId(cfg.unitId);
+      setIsBackup(cfg.role === 'backup');
+      setNodeSecret(cfg.nodeSecret);
+      setConfigured(true);
+      // Se le pasa cfg explícito en vez de depender del estado recién
+      // asignado arriba (los setState de este mismo efecto todavía no se
+      // reflejan en las variables locales de esta función).
+      connect(cfg);
+    })();
+    // Solo al montar: connect se llama con cfg explícito, no necesita
+    // volver a dispararse por cambios de estado.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function guardarYConectar() {
+    const cfg: NodeConfig = { brokerUrl, username, password, nodeId, unitId, role, nodeSecret };
+    await SecureStore.setItemAsync(NODE_CONFIG_KEY, JSON.stringify(cfg));
+    setConfigured(true);
+    connect(cfg);
+  }
+
+  async function reconfigurar() {
+    disconnect();
+    await SecureStore.deleteItemAsync(NODE_CONFIG_KEY);
+    setConfigured(false);
+  }
 
   // Acelerómetro
   const [accelAvailable, setAccelAvailable] = useState<boolean | null>(null);
@@ -421,6 +486,7 @@ export default function NodoScreen() {
       nodeId,
       unitId,
       role,
+      nodeSecret,
       seq: seqRef.current,
       ts: Date.now(),
       type: 'event',
@@ -530,7 +596,7 @@ export default function NodoScreen() {
         sub?.remove?.();
       } catch {}
     };
-  }, [samplingMs, status, nodeId, unitId, role, impactThresholdG]);
+  }, [samplingMs, status, nodeId, unitId, role, nodeSecret, impactThresholdG]);
 
   // Suscripción al giroscopio real — misma frecuencia que el acelerómetro,
   // alimenta el indicador de movimiento y el estimador inercial de velocidad.
@@ -601,7 +667,7 @@ export default function NodoScreen() {
         sub?.remove?.();
       } catch {}
     };
-  }, [samplingMs, status, nodeId, unitId, role, doorOpenLux, doorClosedLux]);
+  }, [samplingMs, status, nodeId, unitId, role, nodeSecret, doorOpenLux, doorClosedLux]);
 
   // Suscripción al barómetro real — solo enriquece telemetry (pressureHpa),
   // no genera eventos propios.
@@ -765,15 +831,22 @@ export default function NodoScreen() {
     };
   }, [gpsIntervalMs]);
 
-  function connect() {
+  // Acepta un cfg explícito (usado al auto-conectar desde SecureStore,
+  // justo tras leerlo, cuando el estado todavía no se actualizó en esta
+  // misma función) — el botón "Guardar y conectar" también lo pasa así
+  // por lo mismo. Sin cfg, usa el estado actual (no debería pasar hoy,
+  // pero deja la función utilizable sola si algo más la llama).
+  function connect(cfg?: NodeConfig) {
+    const effective: NodeConfig = cfg ?? { brokerUrl, username, password, nodeId, unitId, role, nodeSecret };
+
     clientRef.current?.end(true);
     setStatus('connecting');
-    appendLog(`Conectando a ${brokerUrl}...`);
+    appendLog(`Conectando a ${effective.brokerUrl}...`);
 
-    const client = mqtt.connect(brokerUrl, {
-      username,
-      password,
-      clientId: nodeId,
+    const client = mqtt.connect(effective.brokerUrl, {
+      username: effective.username,
+      password: effective.password,
+      clientId: effective.nodeId,
       // clean:false + clientId estable = el broker guarda los comandos
       // emitidos mientras el nodo esta sin señal y se los entrega al
       // reconectar (ADR 0002 de sit-ciit-infra, paso 7 del guion).
@@ -784,7 +857,7 @@ export default function NodoScreen() {
     client.on('connect', () => {
       setStatus('connected');
       appendLog('Conectado');
-      client.subscribe(`sitciit/${nodeId}/cmd`, { qos: 1 }, (err) => {
+      client.subscribe(`sitciit/${effective.nodeId}/cmd`, { qos: 1 }, (err) => {
         if (err) appendLog(`Fallo al suscribirse a comandos: ${err.message}`);
         else appendLog('Escuchando comandos del centro de control');
       });
@@ -823,6 +896,7 @@ export default function NodoScreen() {
       nodeId,
       unitId,
       role,
+      nodeSecret,
       seq: seqRef.current,
       ts: Date.now(),
       type: 'telemetry',
@@ -866,7 +940,7 @@ export default function NodoScreen() {
     const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
     const id = setInterval(publishTelemetry, intervalMs);
     return () => clearInterval(id);
-  }, [autoPublish, status, samplingMs, nodeId, unitId, role]);
+  }, [autoPublish, status, samplingMs, nodeId, unitId, role, nodeSecret]);
 
   /** Confirma un comando hacia la nube. El backend mueve el estado del
    *  comando con esto (sent -> delivered -> executed/rejected). */
@@ -881,6 +955,7 @@ export default function NodoScreen() {
       nodeId,
       unitId,
       role,
+      nodeSecret,
       seq: seqRef.current,
       ts: Date.now(),
       type: 'ack',
@@ -1016,6 +1091,7 @@ export default function NodoScreen() {
       nodeId,
       unitId,
       role,
+      nodeSecret,
       seq: seqRef.current,
       ts: Date.now(),
       type: 'heartbeat',
@@ -1045,7 +1121,7 @@ export default function NodoScreen() {
     if (status !== 'connected') return;
     const id = setInterval(publishHeartbeat, HEARTBEAT_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [status, nodeId, unitId, role]);
+  }, [status, nodeId, unitId, role, nodeSecret]);
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
@@ -1104,20 +1180,38 @@ export default function NodoScreen() {
         placeholder="ms entre lecturas de GPS (5000 = 5s)"
       />
 
-      <Text style={styles.sectionLabel}>Identidad del nodo</Text>
-      <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
-      <TextInput style={styles.input} placeholderTextColor="#999999" value={unitId} onChangeText={setUnitId} placeholder="unitId" autoCapitalize="none" />
-      <View style={styles.row}>
-        <Text>Rol: {role}</Text>
-        <Switch value={isBackup} onValueChange={setIsBackup} />
-      </View>
+      {configured === null ? (
+        <Text style={styles.reading}>Cargando configuración guardada...</Text>
+      ) : configured ? (
+        <>
+          <Text style={styles.sectionLabel}>Nodo configurado</Text>
+          <Text style={styles.reading}>
+            {nodeId} ({unitId}, {role === 'primary' ? 'primario' : 'respaldo'})
+          </Text>
+          <Button title="Reconfigurar" onPress={reconfigurar} />
+        </>
+      ) : (
+        <>
+          <Text style={styles.sectionLabel}>Identidad del nodo</Text>
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={unitId} onChangeText={setUnitId} placeholder="unitId" autoCapitalize="none" />
+          <View style={styles.row}>
+            <Text>Rol: {role}</Text>
+            <Switch value={isBackup} onValueChange={setIsBackup} />
+          </View>
+          {/* Lo genera el CRUD de Nodos en el dashboard (rol control_center)
+              — se pega una sola vez, aquí, y luego se guarda cifrado en el
+              celular; ver contrato v1.3.0. */}
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeSecret} onChangeText={setNodeSecret} placeholder="secreto del nodo (dashboard → Nodos)" secureTextEntry autoCapitalize="none" />
 
-      <Text style={styles.sectionLabel}>Conexión MQTT</Text>
-      <TextInput style={styles.input} placeholderTextColor="#999999" value={brokerUrl} onChangeText={setBrokerUrl} placeholder="ws://<ip>:9001" autoCapitalize="none" />
-      <TextInput style={styles.input} placeholderTextColor="#999999" value={username} onChangeText={setUsername} placeholder="usuario" autoCapitalize="none" />
-      <TextInput style={styles.input} placeholderTextColor="#999999" value={password} onChangeText={setPassword} placeholder="contraseña" secureTextEntry autoCapitalize="none" />
+          <Text style={styles.sectionLabel}>Conexión MQTT</Text>
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={brokerUrl} onChangeText={setBrokerUrl} placeholder="ws://<ip>:9001" autoCapitalize="none" />
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={username} onChangeText={setUsername} placeholder="usuario" autoCapitalize="none" />
+          <TextInput style={styles.input} placeholderTextColor="#999999" value={password} onChangeText={setPassword} placeholder="contraseña" secureTextEntry autoCapitalize="none" />
 
-      <Button title="Conectar" onPress={connect} disabled={status === 'connecting'} />
+          <Button title="Guardar y conectar" onPress={guardarYConectar} disabled={status === 'connecting' || !nodeSecret} />
+        </>
+      )}
       <View style={styles.spacer} />
       <Button title="Desconectar" onPress={disconnect} disabled={status === 'idle'} />
 
