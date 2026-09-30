@@ -1,10 +1,5 @@
 /* Cola de salida persistente (store-and-forward).
  *
- * El corredor tiene tramos sin cobertura. Hasta ahora, un mensaje
- * generado sin conexión se descartaba en silencio: `publishEvent`
- * devolvía temprano si el cliente MQTT no estaba conectado, así que un
- * impacto dentro de un túnel se perdía para siempre.
- *
  * Aquí todo mensaje saliente se escribe primero en SQLite y se borra
  * solo cuando el broker confirma la entrega (QoS 1). Si la app se cierra
  * o el teléfono se apaga, la cola sigue ahí al volver.
@@ -17,9 +12,8 @@
 
 import * as SQLite from 'expo-sqlite';
 
-/** Tope de la cola. A 1 Hz son unas 5 horas de telemetría; pasado eso
- *  se descartan los más viejos para no llenar el almacenamiento del
- *  teléfono. Los eventos nunca se descartan (ver `encolar`). */
+/** Tope de 20 000 mensajes. Si hace falta espacio, se quita telemetría
+ *  y heartbeat antiguos antes que eventos, que se preservan. */
 const MAX_FILAS = 20_000;
 
 /** Cuántos mensajes se envían por tanda al recuperar la conexión.
@@ -68,7 +62,7 @@ export async function encolar(
   topic: string,
   payload: string,
   tipo: TipoMensaje,
-): Promise<void> {
+): Promise<number> {
   if (!db) await abrirOutbox();
   const d = db!;
 
@@ -78,16 +72,19 @@ export async function encolar(
   );
 
   const fila = await d.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM outbox');
+  let telemetriaAntiguaEliminada = 0;
   if ((fila?.n ?? 0) > MAX_FILAS) {
     const sobran = (fila?.n ?? 0) - MAX_FILAS;
-    await d.runAsync(
+    const resultado = await d.runAsync(
       `DELETE FROM outbox WHERE id IN (
          SELECT id FROM outbox WHERE tipo IN ('telemetry', 'heartbeat')
          ORDER BY id LIMIT ?
        )`,
       [sobran],
     );
+    telemetriaAntiguaEliminada = resultado.changes;
   }
+  return telemetriaAntiguaEliminada;
 }
 
 /** Siguiente tanda a enviar, en orden de encolado. */

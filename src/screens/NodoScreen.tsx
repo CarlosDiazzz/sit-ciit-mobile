@@ -56,9 +56,8 @@ import {
 // gps.speedMs — el GPS es la única fuente confiable de velocidad; el
 // acelerómetro NO se usa para eso (integrarlo dos veces para obtener
 // velocidad acumula error / deriva muy rápido y daría un número falso).
-// Pendiente para fases siguientes: luz/presión, detección de eventos en
-// el borde (Fase 2), outbox SQLite (Fase 3), pantalla de configuración
-// persistente y manejo de comandos (Fase 4).
+// La telemetría y los eventos se escriben primero en SQLite; la cola se
+// entrega al broker al conectar. La configuración se conserva cifrada.
 
 type Status = 'idle' | 'connecting' | 'connected' | 'error';
 type NodeRole = 'primary' | 'backup';
@@ -85,6 +84,7 @@ interface GpsReading {
 // ante el backend (contrato v1.3.0); sin SecureStore quedaría en texto
 // plano, y es un secreto real, no una preferencia de UI.
 const NODE_CONFIG_KEY = 'sitciit.nodeConfig';
+const AUTO_PUBLISH_KEY = 'sitciit.autoPublish';
 
 interface NodeConfig {
   brokerUrl: string;
@@ -121,10 +121,8 @@ const MOVEMENT_EXIT_G = 0.03;
 const ROTATION_ENTER_RAD_S = 0.35;
 const ROTATION_EXIT_RAD_S = 0.15;
 
-// Eventos de borde (Fase 2) — se detectan del lado del nodo aunque no
-// haya señal (el outbox de la Fase 3 es lo que falta para no perderlos
-// sin conexión; por ahora, si no está conectado, publishEvent no hace
-// nada — igual que publishTelemetry).
+// Eventos de borde se detectan del lado del nodo aunque no haya señal;
+// publishEvent los conserva en la cola local hasta recuperar MQTT.
 // Umbral sobre la magnitud DINAMICA |a - g_ref| (sin gravedad). Antes
 // eran 2.5 g sobre la magnitud cruda, que en reposo ya vale 1 g: el
 // golpe real que disparaba era de ~1.5 g. Se fija ese valor explicito.
@@ -202,6 +200,8 @@ export default function NodoScreen() {
   // es justo lo frágil que se quería evitar.
   useEffect(() => {
     (async () => {
+      const savedAutoPublish = await SecureStore.getItemAsync(AUTO_PUBLISH_KEY);
+      setAutoPublish(savedAutoPublish === 'true');
       const raw = await SecureStore.getItemAsync(NODE_CONFIG_KEY);
       if (!raw) {
         setConfigured(false);
@@ -228,9 +228,19 @@ export default function NodoScreen() {
 
   async function guardarYConectar() {
     const cfg: NodeConfig = { brokerUrl, username, password, nodeId, unitId, role, nodeSecret };
-    await SecureStore.setItemAsync(NODE_CONFIG_KEY, JSON.stringify(cfg));
+    await Promise.all([
+      SecureStore.setItemAsync(NODE_CONFIG_KEY, JSON.stringify(cfg)),
+      SecureStore.setItemAsync(AUTO_PUBLISH_KEY, String(autoPublish)),
+    ]);
     setConfigured(true);
     connect(cfg);
+  }
+
+  function cambiarPublicacionAutomatica(enabled: boolean) {
+    setAutoPublish(enabled);
+    void SecureStore.setItemAsync(AUTO_PUBLISH_KEY, String(enabled)).catch((err) => {
+      appendLog(`No se pudo guardar la preferencia de telemetría: ${err instanceof Error ? err.message : err}`);
+    });
   }
 
   async function reconfigurar() {
@@ -345,9 +355,8 @@ export default function NodoScreen() {
 
   // Heartbeat: batteryLevel de expo-battery ya es reactivo (0-1, -1 si el
   // dispositivo no reporta). mode lo cambian los comandos (Fase 4); por
-  // ahora siempre "normal". pendingOutbox es 0 hasta que exista una cola
-  // real (Fase 3) — no hay outbox todavía, así que no hay nada pendiente
-  // que reportar honestamente.
+  // ahora siempre "normal". pendingOutbox reporta la cantidad actual de
+  // mensajes SQLite pendientes de confirmación del broker.
   const batteryLevel = useBatteryLevel();
   const [mode, setMode] = useState<NodeMode>('normal');
   // Alarma disparada por comando (trigger_alarm / stop_alarm). El sonido
@@ -873,6 +882,8 @@ export default function NodoScreen() {
     client.on('connect', () => {
       setStatus('connected');
       appendLog('Conectado');
+      // Retoma el almacenamiento pendiente inmediatamente al reconectar.
+      void drenar();
       client.subscribe(`sitciit/${effective.nodeId}/cmd`, { qos: 1 }, (err) => {
         if (err) appendLog(`Fallo al suscribirse a comandos: ${err.message}`);
         else appendLog('Escuchando comandos del centro de control');
@@ -892,7 +903,7 @@ export default function NodoScreen() {
   }
 
   function disconnect() {
-    setAutoPublish(false);
+    cambiarPublicacionAutomatica(false);
     clientRef.current?.end(true);
     clientRef.current = null;
     setStatus('idle');
@@ -960,13 +971,14 @@ export default function NodoScreen() {
     void encolarMensaje(`sitciit/${nodeId}/telemetry`, payload, 'telemetry');
   }
 
-  // Auto-publicación al ritmo de samplingMs mientras está conectado.
+  // La captura sigue activa también sin broker; en ese caso publishTelemetry
+  // escribe en SQLite y la cola se vacía cuando MQTT vuelve.
   useEffect(() => {
-    if (!autoPublish || status !== 'connected') return;
+    if (!autoPublish || configured !== true) return;
     const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
     const id = setInterval(publishTelemetry, intervalMs);
     return () => clearInterval(id);
-  }, [autoPublish, status, samplingMs, nodeId, unitId, role, nodeSecret]);
+  }, [autoPublish, configured, samplingMs, nodeId, unitId, role, nodeSecret]);
 
   /** Confirma un comando hacia la nube. El backend mueve el estado del
    *  comando con esto (sent -> delivered -> executed/rejected). */
@@ -1100,7 +1112,10 @@ export default function NodoScreen() {
    *  conexion, el mensaje espera en SQLite en vez de perderse. */
   async function encolarMensaje(topic: string, payload: string, tipo: TipoMensaje) {
     try {
-      await encolar(topic, payload, tipo);
+      const telemetriaDescartada = await encolar(topic, payload, tipo);
+      if (telemetriaDescartada > 0) {
+        appendLog(`Cola llena: se eliminaron ${telemetriaDescartada} lecturas o latidos antiguos.`);
+      }
       const e = await estadoOutbox();
       setPendientes(e.total);
       void drenar();
@@ -1279,7 +1294,7 @@ export default function NodoScreen() {
         values={{ nodeId, unitId, nodeSecret, brokerUrl, username, password, gpsIntervalMs, samplingMs, impactThresholdG, doorOpenLux, doorClosedLux }}
         onChange={(key, value) => ({ nodeId: setNodeId, unitId: setUnitId, nodeSecret: setNodeSecret, brokerUrl: setBrokerUrl, username: setUsername, password: setPassword, gpsIntervalMs: setGpsIntervalMs, samplingMs: setSamplingMs, impactThresholdG: setImpactThresholdG, doorOpenLux: setDoorOpenLux, doorClosedLux: setDoorClosedLux })[key](value)}
         configured={configured} status={status} isBackup={isBackup} autoPublish={autoPublish} calibrando={calibrando}
-        setIsBackup={setIsBackup} setAutoPublish={setAutoPublish}
+        setIsBackup={setIsBackup} setAutoPublish={cambiarPublicacionAutomatica}
         onSave={guardarYConectar} onReconfigure={reconfigurar} onDisconnect={disconnect}
         onPublish={publishTelemetry} onCalibrate={calibrarEnReposo}
         angle={lastRolloverAngle} sustained={rolloverSinceRef.current != null}
