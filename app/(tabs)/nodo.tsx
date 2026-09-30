@@ -103,7 +103,6 @@ const ROTATION_EXIT_RAD_S = 0.15;
 const DEFAULT_IMPACT_THRESHOLD_G = 1.5;
 // >1.5x el umbral se considera critical, si no warning — evita que todo
 // impacto sea "critical" sin distinción.
-const IMPACT_CRITICAL_MULTIPLIER = 1.5;
 /** Muestras en reposo que se promedian al calibrar (~2 s a 20 ms). */
 const CALIB_MUESTRAS = 100;
 /** Cada cuanto se refresca lo que se ve. El bucle de deteccion corre a
@@ -181,7 +180,6 @@ export default function NodoScreen() {
   // repite mientras se mantenga por encima) para no inundar de eventos
   // durante un jaloneo sostenido.
   const [impactThresholdG, setImpactThresholdG] = useState(String(DEFAULT_IMPACT_THRESHOLD_G));
-  const wasAboveImpactRef = useRef(false);
 
   // Volcadura: referencia "vertical" tomada de la primera lectura (se
   // puede recalibrar a mano con el botón de abajo). rolloverSinceRef
@@ -496,15 +494,10 @@ export default function NodoScreen() {
         // se mantenga arriba. Se mide sobre la magnitud dinamica, que
         // vale 0 en reposo: la cruda incluye la gravedad y desplazaba el
         // umbral en 1 g.
-        const mag = dinamica;
-        const impactThreshold = Number(impactThresholdG) || DEFAULT_IMPACT_THRESHOLD_G;
-        const aboveImpact = mag > impactThreshold;
-        if (aboveImpact && !wasAboveImpactRef.current) {
-          const severity: EventSeverity =
-            mag > impactThreshold * IMPACT_CRITICAL_MULTIPLIER ? 'critical' : 'warning';
-          publishEvent('impact', severity, mag, impactThreshold);
-        }
-        wasAboveImpactRef.current = aboveImpact;
+        // El impacto lo detecta ahora DetectorDinamico (arriba), que
+        // ademas identifica el eje del golpe. Este detector media lo
+        // mismo y emitia un segundo evento con identico valor: en las
+        // pruebas salian pares impact=2.11 / dynamic_impact=2.11.
 
         // Volcadura: primera lectura calibra "vertical"; después se mide
         // el ángulo respecto a esa referencia (se puede recalibrar a mano).

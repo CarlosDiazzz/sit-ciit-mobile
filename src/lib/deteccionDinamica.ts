@@ -143,9 +143,9 @@ export class DetectorDinamico {
     // Orden de prioridad: un golpe fuerte importa más que la oscilación
     // de fondo que lo acompaña.
     return (
-      this.detectarImpacto(e.ahora, magnitud, vertical, horizontal) ??
+      this.detectarImpacto(e.ahora, magnitud, vertical, horizontal, e.velocidadMs) ??
       this.detectarFrenadoOCurva(e, horizontalVec, horizontal) ??
-      this.detectarIrregularidad(e.ahora)
+      this.detectarIrregularidad(e.ahora, e.velocidadMs)
     );
   }
 
@@ -200,9 +200,15 @@ export class DetectorDinamico {
     ahora: number,
     magnitud: number,
     vertical: number,
-    horizontal: number
+    horizontal: number,
+    velocidadMs: number | null
   ): EventoDinamico | null {
     if (magnitud < this.umbrales.dynamicImpactG) return null;
+    // Parado, un golpe es manipulacion de la carga (carga, descarga,
+    // inspeccion), no dinamica de marcha. Sigue siendo informacion util
+    // pero baja de severidad: en las pruebas sobre una mesa salian
+    // decenas de "criticos" que eran manotazos.
+    const enMarcha = (velocidadMs ?? 0) >= 1.5;
     if (!this.pasoCooldown('dynamic_impact', ahora)) return null;
 
     // Un golpe no se "sostiene": es instantáneo, así que no pasa por el
@@ -214,7 +220,11 @@ export class DetectorDinamico {
     this.oscilacion = [];
     return {
       kind: 'dynamic_impact',
-      severity: magnitud > this.umbrales.dynamicImpactG * 2 ? 'critical' : 'warning',
+      severity: !enMarcha
+        ? 'warning'
+        : magnitud > this.umbrales.dynamicImpactG * 2
+          ? 'critical'
+          : 'warning',
       value: magnitud,
       threshold: this.umbrales.dynamicImpactG,
       eje,
@@ -289,7 +299,10 @@ export class DetectorDinamico {
    * distinta de un golpe aislado. Se cuentan los cruces por cero para
    * confirmar que oscila de verdad en vez de ser un solo impulso.
    */
-  private detectarIrregularidad(ahora: number): EventoDinamico | null {
+  private detectarIrregularidad(ahora: number, velocidadMs: number | null): EventoDinamico | null {
+    // La irregularidad de via solo existe rodando. Parado, la
+    // oscilacion es manipulacion de la carga o ruido de la mesa.
+    if ((velocidadMs ?? 0) < 1.5) return null;
     if (this.oscilacion.length < 20) return null;
     if (!this.pasoCooldown('track_irregularity', ahora)) return null;
 
@@ -304,9 +317,11 @@ export class DetectorDinamico {
 
     if (cruces < OSCILACION_MIN_CRUCES) return null;
     if (maximo < this.umbrales.trackIrregularityG) return null;
-    // Por encima del umbral de impacto ya no es rodadura sobre un
-    // defecto, es un golpe: lo reporta detectarImpacto, no esto.
-    if (maximo >= this.umbrales.dynamicImpactG) return null;
+    // Una irregularidad de via es rodadura sobre un defecto, no un
+    // golpe: amplitudes de ese orden son otra cosa (en las pruebas
+    // aparecio una de 1.29 g, que era un manotazo). Se acota a un
+    // tercio del umbral de impacto.
+    if (maximo >= this.umbrales.dynamicImpactG / 3) return null;
 
     this.ultimoEmitido.track_irregularity = ahora;
     this.oscilacion = [];
