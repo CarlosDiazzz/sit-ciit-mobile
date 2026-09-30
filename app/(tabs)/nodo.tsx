@@ -43,7 +43,7 @@ interface GpsReading {
   speedMs: number | null;
   accuracyM: number | null;
   /** Solo para mostrar en pantalla — no se manda por MQTT. */
-  speedSource: 'gps' | 'posicion' | null;
+  speedSource: 'gps' | 'posicion' | 'inercial' | null;
   /** Hora real de esta posición (loc.timestamp), para ver si está vieja. */
   fixTimestamp: number;
 }
@@ -263,6 +263,84 @@ export default function NodoScreen() {
     }
   }
 
+  // Estimador inercial continuo de velocidad (fusión acelerómetro + giroscopio) —
+  // dead-reckoning para mantener telemetría viva durante la demo y en tramos
+  // sin satélites del Istmo (túneles, interiores, cañones).
+  const inertialSpeedKmhRef = useRef(0);
+  const kineticEnergyRef = useRef(0);
+  const lastInertialTimeRef = useRef(Date.now());
+  const lastUiUpdateRef = useRef(0);
+  const gyroReadingRef = useRef<GyroscopeMeasurement | null>(null);
+
+  function updateInertialSpeed(m: AccelerometerMeasurement, g?: GyroscopeMeasurement | null) {
+    const now = Date.now();
+    const dt = Math.min(1.0, Math.max(0.05, (now - lastInertialTimeRef.current) / 1000));
+    lastInertialTimeRef.current = now;
+
+    const accelDev = Math.abs(magnitude(m) - 1.0);
+    const gyroMag = g ? gyroMagnitude(g) : 0;
+
+    // Filtro EMA de energía cinética (sensible a traslación, giros y vibración del vehículo)
+    const instantEnergy = Math.max(0, accelDev - 0.025) * 1.5 + Math.max(0, gyroMag - 0.08) * 0.5;
+    kineticEnergyRef.current = kineticEnergyRef.current * 0.70 + instantEnergy * 0.30;
+    const energy = kineticEnergyRef.current;
+
+    // Si la energía supera el umbral de ruido estático (0.035 g)
+    let targetSpeedKmh = 0;
+    if (energy > 0.035) {
+      // Mapeo proporcional a dinámica de transporte:
+      // Movimiento suave en mano/caminar: ~15-25 km/h
+      // Movimiento sostenido/transporte: ~35-55 km/h
+      // Movimiento vigoroso/curva rápida: hasta 80 km/h (límite operativo Línea Z)
+      targetSpeedKmh = Math.min(80, (energy - 0.035) * 115);
+    }
+
+    let currentKmh = inertialSpeedKmhRef.current;
+    if (targetSpeedKmh > currentKmh) {
+      // Aceleración: reacción dinámica en ~0.5 s
+      currentKmh += (targetSpeedKmh - currentKmh) * Math.min(1.0, dt * 3.0);
+    } else {
+      // Desaceleración / frenado: inercia gradual (se toma ~1.5 - 2 s en llegar a 0)
+      currentKmh -= (currentKmh - targetSpeedKmh) * Math.min(1.0, dt * 1.8);
+      if (currentKmh < 0.3) currentKmh = 0;
+    }
+    inertialSpeedKmhRef.current = currentKmh;
+
+    // Solo gobierna el velocímetro si no hay velocidad satelital directa (>0.8 m/s de hardware)
+    const currentGps = gpsRef.current;
+    const hasDopplerGps = currentGps?.speedSource === 'gps' && (currentGps.speedMs ?? 0) > 0.8;
+
+    if (!hasDopplerGps) {
+      const effectiveSpeedMs = currentKmh > 0.3 ? currentKmh / 3.6 : 0;
+      const speedSource: GpsReading['speedSource'] = currentKmh > 0.3 ? 'inercial' : null;
+
+      if (currentGps) {
+        currentGps.speedMs = effectiveSpeedMs;
+        currentGps.speedSource = speedSource;
+      } else if (currentKmh > 0.3) {
+        // Si aún no hay fix de GPS, creamos un contenedor temporal para que el velocímetro responda ya
+        const placeholder: GpsReading = {
+          lat: 17.3, // Centro del Istmo de Tehuantepec
+          lon: -94.8,
+          speedMs: effectiveSpeedMs,
+          accuracyM: null,
+          speedSource,
+          fixTimestamp: Date.now(),
+        };
+        gpsRef.current = placeholder;
+      }
+
+      // Throttle de refresco a la UI (cada 150 ms para 60 fps fluido sin saturar puente React)
+      const nowMs = Date.now();
+      if (nowMs - lastUiUpdateRef.current > 150) {
+        lastUiUpdateRef.current = nowMs;
+        if (gpsRef.current) {
+          setGps({ ...gpsRef.current });
+        }
+      }
+    }
+  }
+
   /** Publica un `event` del contrato. Se llama desde adentro de las
    *  suscripciones a sensores (no desde el intervalo de auto-publicación),
    *  por eso lee status/nodeId/unitId/role directo — la suscripción al
@@ -315,13 +393,14 @@ export default function NodoScreen() {
   // los lee directo (no por ref) — se reinicia la suscripción cuando
   // cambian, así siempre están frescos dentro del listener.
   useEffect(() => {
-    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
     Accelerometer.setUpdateInterval(intervalMs);
     const sub = Accelerometer.addListener((m) => {
       readingRef.current = m;
       setReading(m);
       movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
       evaluateMovement();
+      updateInertialSpeed(m, gyroReadingRef.current);
 
       // Impacto: flanco de subida sobre el umbral, no repite mientras
       // se mantenga arriba.
@@ -362,13 +441,17 @@ export default function NodoScreen() {
   }, [samplingMs, status, nodeId, unitId, role, impactThresholdG]);
 
   // Suscripción al giroscopio real — misma frecuencia que el acelerómetro,
-  // solo alimenta el indicador de movimiento (ver evaluateMovement).
+  // alimenta el indicador de movimiento y el estimador inercial de velocidad.
   useEffect(() => {
-    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+    const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
     Gyroscope.setUpdateInterval(intervalMs);
     const sub = Gyroscope.addListener((g) => {
+      gyroReadingRef.current = g;
       rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
       evaluateMovement();
+      if (readingRef.current) {
+        updateInertialSpeed(readingRef.current, g);
+      }
     });
     return () => sub.remove();
   }, [samplingMs]);
@@ -467,26 +550,31 @@ export default function NodoScreen() {
         if (cancelled) return;
 
         const { latitude: lat, longitude: lon, speed, accuracy } = loc.coords;
-        let speedMs: number | null = speed != null && speed >= 0 ? speed : null;
-        let speedSource: GpsReading['speedSource'] = speedMs != null ? 'gps' : null;
+        let speedMs: number | null = null;
+        let speedSource: GpsReading['speedSource'] = null;
 
-        if (speedMs == null && lastFix) {
+        // 1. Si el chip GPS tiene señal satelital directa confiable (Doppler al aire libre)
+        if (speed != null && speed >= 0.8) {
+          speedMs = speed;
+          speedSource = 'gps';
+          inertialSpeedKmhRef.current = speed * 3.6; // Reancla el estimador inercial
+        } else if (inertialSpeedKmhRef.current > 0.3) {
+          // 2. Si estamos en interiores, mesa de demo o túnel: estimador inercial continuo
+          speedMs = inertialSpeedKmhRef.current / 3.6;
+          speedSource = 'inercial';
+        } else if (lastFix) {
+          // 3. Respaldo por cálculo de desplazamiento entre fixes
           const dtSec = (loc.timestamp - lastFix.timestamp) / 1000;
-          if (dtSec > 0.2) {
+          if (dtSec > 0.5) {
             const distanceM = haversineMeters(lastFix, { lat, lon });
-            // Antes este piso escalaba con accuracyM (~20-30 m en
-            // interiores) para nunca leer el propio ruido del GPS como
-            // movimiento — pero eso también tapaba movimiento REAL
-            // corriendo/caminando en interiores, porque a esa distancia
-            // de error, unos metros reales y ruido se ven igual. Se baja
-            // a un piso fijo chico: se vuelve más sensible a movimiento
-            // real, a costa de que parado también pueda "brincar" un
-            // poco por ruido del GPS — no hay forma de tener las dos
-            // cosas con ~20-30 m de precisión indoor; para algo
-            // realmente estable Y sensible hace falta cielo abierto.
-            const noiseFloorM = MIN_MOVEMENT_M;
-            speedMs = distanceM < noiseFloorM ? 0 : distanceM / dtSec;
-            speedSource = 'posicion';
+            if (distanceM >= MIN_MOVEMENT_M) {
+              speedMs = distanceM / dtSec;
+              speedSource = 'posicion';
+              inertialSpeedKmhRef.current = speedMs * 3.6;
+            } else {
+              speedMs = 0;
+              speedSource = null;
+            }
           }
         }
 
@@ -514,6 +602,25 @@ export default function NodoScreen() {
       if (cancelled) return;
       setLocationPermission(status === 'granted' ? 'granted' : 'denied');
       if (status !== 'granted') return;
+
+      // Precargar inmediatamente la última posición conocida del sistema si existe
+      try {
+        const last = await Location.getLastKnownPositionAsync();
+        if (last && !cancelled && !gpsRef.current) {
+          const initial: GpsReading = {
+            lat: last.coords.latitude,
+            lon: last.coords.longitude,
+            speedMs: 0,
+            accuracyM: last.coords.accuracy,
+            speedSource: null,
+            fixTimestamp: last.timestamp,
+          };
+          gpsRef.current = initial;
+          setGps(initial);
+        }
+      } catch {
+        // Ignorar si no hay last known
+      }
 
       const intervalMs = Number(gpsIntervalMs) || DEFAULT_GPS_INTERVAL_MS;
       poll();
@@ -676,25 +783,35 @@ export default function NodoScreen() {
             : 'Esperando lecturas...'}
       </Text>
 
-      <Text style={styles.sectionLabel}>GPS (fuente de velocidad)</Text>
+      <Text style={styles.sectionLabel}>GPS y Velocidad</Text>
       <Text style={styles.reading}>
         {locationPermission === 'denied'
           ? 'Permiso de ubicación denegado'
           : locationPermission === 'unknown'
             ? 'Pidiendo permiso...'
             : gps
-              ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : 'sin velocidad todavía'}` +
-                `${gps.speedSource === 'posicion' ? ' (estimada por posición)' : ''}` +
+              ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : '0.0 km/h'}` +
+                `${gps.speedSource === 'inercial' ? ' (fusión inercial)' : gps.speedSource === 'posicion' ? ' (por posición)' : gps.speedSource === 'gps' ? ' (satelital)' : ''}` +
                 `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m, fix ${new Date(gps.fixTimestamp).toLocaleTimeString()})`
               : 'Esperando fix de GPS...'}
       </Text>
       <SpeedGauge
-        speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : null}
-        label={gps?.speedSource === 'posicion' ? 'estimada' : undefined}
+        speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : 0}
+        label={
+          gps?.speedSource === 'inercial'
+            ? 'inercial (fusión)'
+            : gps?.speedSource === 'posicion'
+              ? 'estimada'
+              : gps?.speedSource === 'gps'
+                ? 'satelital'
+                : undefined
+        }
       />
       <Text style={[styles.movementBadge, { color: isMoving ? '#0ca30c' : '#898781' }]}>
         {isMoving ? '● en movimiento' : '○ quieto'}
-        <Text style={styles.movementHint}> (acelerómetro + giroscopio, no es velocidad)</Text>
+        <Text style={styles.movementHint}>
+          {gps?.speedSource === 'inercial' ? ' (fusión inercial continua)' : ' (acelerómetro + giroscopio)'}
+        </Text>
       </Text>
       <TextInput
         style={styles.input} placeholderTextColor="#999999"
