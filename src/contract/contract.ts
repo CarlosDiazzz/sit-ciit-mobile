@@ -1,12 +1,12 @@
 // AUTO-GENERADO por sit-ciit-infra/scripts/sync-contract.sh
-// Copiado de sit-ciit-infra/contracts/contract.ts — version 1.1.0
+// Copiado de sit-ciit-infra/contracts/contract.ts — version 1.2.0
 // No editar aquí: editar la fuente de verdad y volver a correr el script.
 
 // SIT-CIIT — Contrato de mensajes v1.1.0
 // Fuente de verdad. NO editar copias en otros repos: usar scripts/sync-contract.sh
 // desde sit-ciit-infra para propagar cambios.
 
-export const CONTRACT_VERSION = "1.1.0";
+export const CONTRACT_VERSION = "1.2.0";
 
 // ---------------------------------------------------------------------------
 // Tipos compartidos
@@ -74,7 +74,22 @@ export type EventKind =
   | "door_open"
   | "door_closed"
   | "rollover"
-  | "threshold_exceeded";
+  | "threshold_exceeded"
+  // --- Dinámica de marcha (v1.2.0) -------------------------------------
+  // Detectados en el nodo a partir de la aceleración dinámica |a - g_ref|
+  // descompuesta en vertical y horizontal. No requieren saber la
+  // orientación del dispositivo: la gravedad da la referencia.
+  /** Frenado brusco. `value` = desaceleración longitudinal en g. */
+  | "hard_brake"
+  /** Curva tomada con exceso de aceleración lateral.
+   *  `value` = aceleración lateral en g. */
+  | "curve_overspeed"
+  /** Golpe con su eje identificado (vertical: vía o junta; horizontal:
+   *  acoplamiento). `value` = magnitud dinámica en g. */
+  | "dynamic_impact"
+  /** Oscilación vertical sostenida: posible defecto de vía.
+   *  `value` = amplitud en g. */
+  | "track_irregularity";
 
 export type EventSeverity = "info" | "warning" | "critical";
 
