@@ -4,6 +4,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { useZendaTheme } from '@/src/theme/ZendaTheme';
 import { BrandHeader, Card, Footer, Heading } from './ZendaUI';
+import AlarmNotice from './AlarmNotice';
 import SpeedGauge from './SpeedGauge';
 import MotionChart from './MotionChart';
 import AxisMeters from './AxisMeters';
@@ -19,12 +20,19 @@ export interface DashboardData {
 }
 export default function NodeDashboard({ data: d, demo = false, children, demoControls }: { data: DashboardData; demo?: boolean; children?: ReactNode; demoControls?: ReactNode }) {
   const { colors: c } = useZendaTheme();
+  const [dismissedAlarm, setDismissedAlarm] = useState(false);
+  const [previousAlarm, setPreviousAlarm] = useState(d.alarm);
+  if (previousAlarm !== d.alarm) {
+    setPreviousAlarm(d.alarm);
+    setDismissedAlarm(false);
+  }
   const [tab, setTab] = useState('Resumen');
   const connected = d.status === 'connected';
   const connection = connected ? 'Conectado' : d.status === 'connecting' ? 'Conectando' : d.status === 'error' ? 'Error de conexión' : 'Sin conexión';
   const metric = (title: string, value: string, subtitle: string) => <View style={[s.metric, { backgroundColor: c.bg }]}><Text style={[s.label, { color: c.muted }]}>{title}</Text><Text style={[s.metricValue, { color: c.ink }]}>{value}</Text><Text style={[s.small, { color: c.muted }]}>{subtitle}</Text></View>;
   return <SafeAreaView edges={['top', 'left', 'right']} style={{ flex: 1, backgroundColor: c.bg }}>
     <StatusBar style={c.dark ? 'light' : 'dark'} />
+    {d.alarm && !dismissedAlarm && <AlarmNotice message={`Alarma activa en la unidad ${d.unitId} · Nodo ${d.nodeId}${demo ? ' · Simulación' : ''}`} onDismiss={() => setDismissedAlarm(true)} />}
     <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
       <BrandHeader />
       <View style={s.pageHeading}><View style={{ flex: 1 }}><Text style={[s.eyebrow, { color: c.gold }]}>TU CAMINO, BAJO CONTROL</Text><Text style={[s.title, { color: c.ink }]}>Monitoreo</Text></View><View style={[s.chip, { backgroundColor: demo ? c.soft : c.tint }]}><Text style={{ color: demo ? c.accent : c.green, fontSize: 10, fontWeight: '700' }}>{demo ? '◉  DEMOSTRACIÓN' : '◉  DISPOSITIVO'}</Text></View></View>

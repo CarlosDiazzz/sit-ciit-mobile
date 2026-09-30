@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 
+import AlarmNotice from '@/src/components/AlarmNotice';
 import { BrandHeader, Card, Heading, Action, Field, Footer } from '@/src/components/ZendaUI';
 import { useZendaTheme } from '@/src/theme/ZendaTheme';
 import { useSession } from '@/src/lib/session';
@@ -78,6 +79,7 @@ export default function OperadorScreen() {
     await logout();
     setUnidades([]);
     setAlertas([]);
+    setNotice(null);
   }
 
   // --- Unidades (para elegir nodo destino) ---
@@ -104,6 +106,8 @@ export default function OperadorScreen() {
   const [socketStatus, setSocketStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
 
   // --- Alertas y avances de comando en vivo ---
+  const noticeSequence = useRef(0);
+  const [notice, setNotice] = useState<{ id: number; message: string } | null>(null);
   const [alertas, setAlertas] = useState<Actividad[]>([]);
   const [ultimoComando, setUltimoComando] = useState<{ cmdId: string; targetNodeCode: string; action: CmdAction } | null>(
     null,
@@ -125,6 +129,9 @@ export default function OperadorScreen() {
     }
 
     function onEvent(payload: EventBroadcast) {
+      if (payload.severity !== 'info') {
+        setNotice({ id: ++noticeSequence.current, message: `${payload.kind} · Unidad ${payload.unitId}${payload.nodeId ? ` · Nodo ${payload.nodeId}` : ''}` });
+      }
       if (payload.severity === 'critical') {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       }
@@ -255,6 +262,7 @@ export default function OperadorScreen() {
   return (
     <SafeAreaView edges={['top', 'left', 'right']} style={{ flex: 1, backgroundColor: c.bg }}>
       <ScrollView contentContainerStyle={{ padding: 20, width: '100%', maxWidth: 620, alignSelf: 'center' }}>
+        {notice && <AlarmNotice key={notice.id} message={notice.message} onDismiss={() => setNotice(null)} />}
         <BrandHeader />
         <Heading eyebrow="OPERADOR" title="Centro de operación" aside={session.user.email} />
 

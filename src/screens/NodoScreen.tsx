@@ -382,9 +382,7 @@ export default function NodoScreen() {
   // mensajes SQLite pendientes de confirmación del broker.
   const batteryLevel = useBatteryLevel();
   const [mode, setMode] = useState<NodeMode>('normal');
-  // Alarma disparada por comando (trigger_alarm / stop_alarm). El sonido
-  // llega con expo-av en la Fase 2; por ahora vibracion, que no depende
-  // del volumen del telefono.
+  // Alarma por comando; NodeDashboard muestra el aviso y reproduce audio local.
   const [alarmOn, setAlarmOn] = useState(false);
   const capabilities = [
     accelAvailable ? 'accelerometer' : null,

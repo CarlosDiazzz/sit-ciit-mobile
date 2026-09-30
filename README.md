@@ -47,3 +47,9 @@ src/contract/contract.ts copia sincronizada desde sit-ciit-infra
 correr en React Native. Se resuelve en la Fase 1, junto con la primera
 conexión real al broker. Si no queda estable, la alternativa (WebSocket
 simple o Socket.IO) se decide ahí antes de seguir — ver `CLAUDE.md`.
+
+### Avisos de alarma
+
+Con la app abierta, un comando `trigger_alarm` muestra un aviso en Nodo; los eventos `warning` y `critical` recibidos por Socket.IO muestran un aviso en Operador. El aviso usa un icono gráfico rojo y un tono local repetido, sin descargar archivos. «Silenciar y cerrar» detiene el sonido del aviso; para detener la alarma del nodo se envía `stop_alarm`. Los eventos informativos permanecen en el historial.
+
+El audio usa `expo-audio`, compatible con SDK 57 y Expo Go; no pide acceso al micrófono ni habilita reproducción en segundo plano. El volumen depende del dispositivo. Verificar el sonido en Android/iOS reales; los navegadores pueden bloquear la reproducción automática.
