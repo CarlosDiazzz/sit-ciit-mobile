@@ -19,6 +19,13 @@ import { v4 as uuidv4 } from 'uuid';
 import { Text, View } from '@/components/Themed';
 import SpeedGauge from '@/src/components/SpeedGauge';
 import {
+  MedidorFrecuencia,
+  anguloDesdeReferencia,
+  magnitudDinamica,
+  promediar,
+  type Vector3,
+} from '@/src/lib/dinamica';
+import {
   CONTRACT_VERSION,
   isActionAllowedForRole,
   type CmdAction,
@@ -54,6 +61,11 @@ interface GpsReading {
 }
 
 const DEFAULT_SAMPLING_MS = 1000;
+/** Intervalo del bucle de deteccion, independiente del de publicacion.
+ *  Los eventos dinamicos (frenado, curva, golpe de via) duran decimas de
+ *  segundo: a 150 ms se perdian. Es una sugerencia — Android entrega lo
+ *  que el hardware permite, y por eso se mide el ritmo real. */
+const DETECTION_INTERVAL_MS = 20;
 const DEFAULT_GPS_INTERVAL_MS = 5000;
 // Fijo por contrato ("late cada 5 s"), no configurable como samplingMs.
 const HEARTBEAT_INTERVAL_MS = 5000;
@@ -77,10 +89,19 @@ const ROTATION_EXIT_RAD_S = 0.15;
 // haya señal (el outbox de la Fase 3 es lo que falta para no perderlos
 // sin conexión; por ahora, si no está conectado, publishEvent no hace
 // nada — igual que publishTelemetry).
-const DEFAULT_IMPACT_THRESHOLD_G = 2.5;
+// Umbral sobre la magnitud DINAMICA |a - g_ref| (sin gravedad). Antes
+// eran 2.5 g sobre la magnitud cruda, que en reposo ya vale 1 g: el
+// golpe real que disparaba era de ~1.5 g. Se fija ese valor explicito.
+const DEFAULT_IMPACT_THRESHOLD_G = 1.5;
 // >1.5x el umbral se considera critical, si no warning — evita que todo
 // impacto sea "critical" sin distinción.
 const IMPACT_CRITICAL_MULTIPLIER = 1.5;
+/** Muestras en reposo que se promedian al calibrar (~2 s a 20 ms). */
+const CALIB_MUESTRAS = 100;
+/** Cada cuanto se refresca lo que se ve. El bucle de deteccion corre a
+ *  la velocidad del sensor; la pantalla no necesita ir tan rapido y a
+ *  50 renders/s se congela. */
+const UI_REFRESH_MS = 200;
 const ROLLOVER_ANGLE_DEG = 60;
 const ROLLOVER_SUSTAIN_MS = 2000;
 
@@ -96,17 +117,6 @@ function magnitude(m: AccelerometerMeasurement): number {
   return Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
 }
 
-/** Ángulo entre la lectura actual y una referencia "vertical" (en
- *  grados) — para volcadura, no importa la magnitud de cada vector, solo
- *  qué tanto rotó respecto a como estaba al calibrar. */
-function angleFromReferenceDeg(current: AccelerometerMeasurement, reference: AccelerometerMeasurement): number {
-  const dot = current.x * reference.x + current.y * reference.y + current.z * reference.z;
-  const magCurrent = magnitude(current);
-  const magRef = magnitude(reference);
-  if (magCurrent === 0 || magRef === 0) return 0;
-  const cos = Math.min(1, Math.max(-1, dot / (magCurrent * magRef)));
-  return (Math.acos(cos) * 180) / Math.PI;
-}
 
 function gyroMagnitude(g: GyroscopeMeasurement): number {
   return Math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
@@ -169,10 +179,34 @@ export default function NodoScreen() {
   // puede recalibrar a mano con el botón de abajo). rolloverSinceRef
   // marca cuándo empezó a estar inclinado; solo dispara si se sostiene
   // ROLLOVER_SUSTAIN_MS, y no repite mientras siga volcado.
-  const referenceGravityRef = useRef<AccelerometerMeasurement | null>(null);
+  // Vector de gravedad de referencia, promediado en reposo: es un
+  // vector, no una medicion puntual, asi que no lleva timestamp.
+  const referenceGravityRef = useRef<Vector3 | null>(null);
   const rolloverSinceRef = useRef<number | null>(null);
   const rolloverFiredRef = useRef(false);
   const [lastRolloverAngle, setLastRolloverAngle] = useState<number | null>(null);
+  // Sesgo del giroscopio: parado rara vez marca cero exacto, y ese error
+  // se acumula al integrar. Se mide al recalibrar y se resta despues.
+  const gyroBiasRef = useRef<Vector3 | null>(null);
+  const [calibrando, setCalibrando] = useState(false);
+  const muestrasCalibRef = useRef<{ accel: Vector3[]; gyro: Vector3[] }>({ accel: [], gyro: [] });
+  // Frecuencia efectiva del sensor: setUpdateInterval es una sugerencia,
+  // Android entrega lo que el hardware permite.
+  const medidorAccelRef = useRef(new MedidorFrecuencia());
+  const [hzReal, setHzReal] = useState<number | null>(null);
+  const calibrandoRef = useRef(false);
+  const anguloRef = useRef<number | null>(null);
+
+  // Refresco de la UI desacoplado del sensor: lee las refs que el bucle
+  // de deteccion va llenando y actualiza el estado a ritmo humano.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (readingRef.current) setReading(readingRef.current);
+      setLastRolloverAngle(anguloRef.current);
+      setHzReal(medidorAccelRef.current.hz);
+    }, UI_REFRESH_MS);
+    return () => clearInterval(id);
+  }, []);
 
   // Luz (puerta) — Android-only, ver LightSensor de expo-sensors.
   const [lightAvailable, setLightAvailable] = useState<boolean | null>(null);
@@ -411,18 +445,32 @@ export default function NodoScreen() {
   useEffect(() => {
     let sub: { remove: () => void } | null = null;
     try {
-      const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
-      Accelerometer.setUpdateInterval(intervalMs);
+      // La deteccion va a su propio ritmo; la publicacion MQTT sigue
+      // usando samplingMs.
+      Accelerometer.setUpdateInterval(DETECTION_INTERVAL_MS);
       sub = Accelerometer.addListener((m) => {
         readingRef.current = m;
-        setReading(m);
-        movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
+        // La UI NO se actualiza aqui: a 20 ms serian 50 renders por
+        // segundo y la pantalla se congela. El bucle de deteccion corre
+        // a la velocidad del sensor y un intervalo aparte refresca lo
+        // que se ve (ver el efecto de refresco de UI mas abajo).
+        medidorAccelRef.current.registrar();
+
+        // Calibracion: acumula muestras en reposo para promediarlas.
+        if (muestrasCalibRef.current.accel.length < CALIB_MUESTRAS && calibrandoRef.current) {
+          muestrasCalibRef.current.accel.push(m);
+        }
+
+        const dinamica = magnitudDinamica(m, referenceGravityRef.current);
+        movementEmaRef.current = movementEmaRef.current * 0.7 + dinamica * 0.3;
         evaluateMovement();
         updateInertialSpeed(m);
 
         // Impacto: flanco de subida sobre el umbral, no repite mientras
-        // se mantenga arriba.
-        const mag = magnitude(m);
+        // se mantenga arriba. Se mide sobre la magnitud dinamica, que
+        // vale 0 en reposo: la cruda incluye la gravedad y desplazaba el
+        // umbral en 1 g.
+        const mag = dinamica;
         const impactThreshold = Number(impactThresholdG) || DEFAULT_IMPACT_THRESHOLD_G;
         const aboveImpact = mag > impactThreshold;
         if (aboveImpact && !wasAboveImpactRef.current) {
@@ -437,8 +485,8 @@ export default function NodoScreen() {
         if (!referenceGravityRef.current) {
           referenceGravityRef.current = m;
         } else {
-          const angle = angleFromReferenceDeg(m, referenceGravityRef.current);
-          setLastRolloverAngle(angle);
+          const angle = anguloDesdeReferencia(m, referenceGravityRef.current);
+          anguloRef.current = angle;
           if (angle > ROLLOVER_ANGLE_DEG) {
             if (rolloverSinceRef.current == null) {
               rolloverSinceRef.current = Date.now();
@@ -470,10 +518,12 @@ export default function NodoScreen() {
   useEffect(() => {
     let sub: { remove: () => void } | null = null;
     try {
-      const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
-      Gyroscope.setUpdateInterval(intervalMs);
+      Gyroscope.setUpdateInterval(DETECTION_INTERVAL_MS);
       sub = Gyroscope.addListener((g) => {
         gyroReadingRef.current = g;
+        if (calibrandoRef.current && muestrasCalibRef.current.gyro.length < CALIB_MUESTRAS) {
+          muestrasCalibRef.current.gyro.push(g);
+        }
         rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
         evaluateMovement();
         if (readingRef.current) {
@@ -976,7 +1026,9 @@ export default function NodoScreen() {
         <Text style={styles.alarmBanner}>ALARMA ACTIVA — comando del centro de control</Text>
       ) : null}
 
-      <Text style={styles.sectionLabel}>Acelerómetro</Text>
+      <Text style={styles.sectionLabel}>
+        Acelerómetro{hzReal != null ? ` — ${hzReal.toFixed(0)} Hz reales` : ''}
+      </Text>
       <Text style={styles.reading}>
         {accelAvailable === false
           ? 'No disponible en este dispositivo'
@@ -1068,12 +1120,39 @@ export default function NodoScreen() {
         placeholder="umbral de impacto en g (2.5 = default)"
       />
       <Button
-        title="Recalibrar vertical (volcadura)"
+        title={calibrando ? 'Calibrando, mantén el equipo quieto…' : 'Calibrar en reposo (vertical + giroscopio)'}
+        disabled={calibrando}
         onPress={() => {
-          referenceGravityRef.current = readingRef.current;
-          rolloverSinceRef.current = null;
-          rolloverFiredRef.current = false;
-          appendLog('Vertical recalibrada');
+          // Promediar varias muestras en reposo, en vez de tomar una
+          // sola: una lectura suelta arrastra el ruido del sensor a la
+          // referencia, y todo lo demás se mide contra ella.
+          muestrasCalibRef.current = { accel: [], gyro: [] };
+          calibrandoRef.current = true;
+          setCalibrando(true);
+          appendLog('Calibrando: mantén el equipo quieto 2 s');
+
+          setTimeout(() => {
+            calibrandoRef.current = false;
+            setCalibrando(false);
+            const { accel, gyro } = muestrasCalibRef.current;
+
+            const gravedad = promediar(accel);
+            if (gravedad) {
+              referenceGravityRef.current = gravedad;
+              rolloverSinceRef.current = null;
+              rolloverFiredRef.current = false;
+            }
+            // Sesgo del giroscopio: lo que marca estando quieto. Sin
+            // restarlo, el error se acumula al integrar la rotación.
+            const sesgo = promediar(gyro);
+            if (sesgo) gyroBiasRef.current = sesgo;
+
+            appendLog(
+              gravedad
+                ? `Calibrado con ${accel.length} muestras (sesgo giro: ${sesgo ? sesgo.x.toFixed(3) : 'n/d'})`
+                : 'No se pudo calibrar: sin lecturas del acelerómetro'
+            );
+          }, CALIB_MUESTRAS * 20 + 500);
         }}
       />
 
