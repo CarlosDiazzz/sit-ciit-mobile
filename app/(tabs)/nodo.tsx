@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, ScrollView, StyleSheet, Switch, TextInput } from 'react-native';
+import { Button, ScrollView, StyleSheet, Switch, TextInput, Vibration } from 'react-native';
 import {
   Accelerometer,
   Barometer,
@@ -18,7 +18,12 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { Text, View } from '@/components/Themed';
 import SpeedGauge from '@/src/components/SpeedGauge';
-import { CONTRACT_VERSION } from '@/src/contract/contract';
+import {
+  CONTRACT_VERSION,
+  isActionAllowedForRole,
+  type CmdAction,
+  type IssuerRole,
+} from '@/src/contract/contract';
 
 // Modo Nodo: conecta al broker de sit-ciit-infra y publica lecturas reales
 // del acelerómetro y del GPS del celular como mensajes `telemetry` del
@@ -216,7 +221,11 @@ export default function NodoScreen() {
   // real (Fase 3) — no hay outbox todavía, así que no hay nada pendiente
   // que reportar honestamente.
   const batteryLevel = useBatteryLevel();
-  const [mode] = useState<NodeMode>('normal');
+  const [mode, setMode] = useState<NodeMode>('normal');
+  // Alarma disparada por comando (trigger_alarm / stop_alarm). El sonido
+  // llega con expo-av en la Fase 2; por ahora vibracion, que no depende
+  // del volumen del telefono.
+  const [alarmOn, setAlarmOn] = useState(false);
   const capabilities = [
     accelAvailable ? 'accelerometer' : null,
     gyroAvailable ? 'gyroscope' : null,
@@ -232,6 +241,16 @@ export default function NodoScreen() {
   batteryLevelRef.current = batteryLevel;
   const capabilitiesRef = useRef(capabilities);
   capabilitiesRef.current = capabilities;
+  useEffect(() => {
+    if (!alarmOn) {
+      Vibration.cancel();
+      return;
+    }
+    // Patron repetido: espera 0, vibra 600ms, pausa 400ms.
+    Vibration.vibrate([0, 600, 400], true);
+    return () => Vibration.cancel();
+  }, [alarmOn]);
+
   const modeRef = useRef(mode);
   modeRef.current = mode;
 
@@ -686,13 +705,24 @@ export default function NodoScreen() {
       username,
       password,
       clientId: nodeId,
-      clean: true, // Fase 1: sin retención de sesión todavía (eso es Fase 3/4)
+      // clean:false + clientId estable = el broker guarda los comandos
+      // emitidos mientras el nodo esta sin señal y se los entrega al
+      // reconectar (ADR 0002 de sit-ciit-infra, paso 7 del guion).
+      clean: false,
       reconnectPeriod: 2000,
     });
 
     client.on('connect', () => {
       setStatus('connected');
       appendLog('Conectado');
+      client.subscribe(`sitciit/${nodeId}/cmd`, { qos: 1 }, (err) => {
+        if (err) appendLog(`Fallo al suscribirse a comandos: ${err.message}`);
+        else appendLog('Escuchando comandos del centro de control');
+      });
+    });
+
+    client.on('message', (topic, payload) => {
+      if (topic.endsWith('/cmd')) handleCommand(payload);
     });
     client.on('error', (err) => {
       setStatus('error');
@@ -769,6 +799,132 @@ export default function NodoScreen() {
     return () => clearInterval(id);
   }, [autoPublish, status, samplingMs, nodeId, unitId, role]);
 
+  /** Confirma un comando hacia la nube. El backend mueve el estado del
+   *  comando con esto (sent -> delivered -> executed/rejected). */
+  function publishAck(cmdId: string, ackStatus: 'delivered' | 'executed' | 'rejected', reason?: string) {
+    const client = clientRef.current;
+    if (!client) return;
+
+    seqRef.current += 1;
+    const payload = JSON.stringify({
+      contractVersion: CONTRACT_VERSION,
+      msgId: uuidv4(),
+      nodeId,
+      unitId,
+      role,
+      seq: seqRef.current,
+      ts: Date.now(),
+      type: 'ack',
+      cmdId,
+      status: ackStatus,
+      ...(reason ? { reason } : {}),
+    });
+
+    client.publish(`sitciit/${nodeId}/ack`, payload, { qos: 1 }, (err) => {
+      if (err) appendLog(`Fallo al confirmar ${ackStatus}: ${err.message}`);
+    });
+  }
+
+  /** Comandos ya ejecutados, para no repetir la accion si el broker
+   *  reentrega el mismo cmdId (QoS 1 garantiza "al menos una vez"). */
+  const cmdVistosRef = useRef<Set<string>>(new Set());
+
+  function handleCommand(payload: Buffer | Uint8Array) {
+    let cmd: {
+      cmdId?: string;
+      action?: CmdAction;
+      params?: Record<string, unknown>;
+      issuedBy?: { role?: IssuerRole };
+    };
+    try {
+      cmd = JSON.parse(payload.toString());
+    } catch {
+      appendLog('Comando recibido con JSON invalido, descartado');
+      return;
+    }
+
+    const { cmdId, action } = cmd;
+    if (!cmdId || !action) {
+      appendLog('Comando sin cmdId o accion, descartado');
+      return;
+    }
+
+    // Acuse de recibo inmediato, antes de ejecutar: el centro de control
+    // ve "Entregado" aunque la accion tarde o falle.
+    publishAck(cmdId, 'delivered');
+
+    if (cmdVistosRef.current.has(cmdId)) {
+      appendLog(`Comando ${action} repetido, ya ejecutado`);
+      return;
+    }
+
+    // El backend ya valido la autoridad, pero el nodo revalida: es la
+    // segunda linea de defensa que pide el contrato.
+    const rol = cmd.issuedBy?.role;
+    if (rol && !isActionAllowedForRole(action, rol)) {
+      appendLog(`Comando ${action} rechazado: el rol ${rol} no puede emitirlo`);
+      publishAck(cmdId, 'rejected', `rol ${rol} no autorizado para ${action}`);
+      return;
+    }
+
+    const params = cmd.params ?? {};
+    try {
+      switch (action) {
+        case 'set_sampling_rate': {
+          const ms = Number(params.samplingMs);
+          if (!Number.isFinite(ms) || ms < 100 || ms > 60000) {
+            throw new Error('samplingMs fuera de rango (100-60000)');
+          }
+          setSamplingMs(String(Math.round(ms)));
+          appendLog(`Muestreo ajustado a ${Math.round(ms)} ms`);
+          break;
+        }
+        case 'set_mode': {
+          const m = String(params.mode);
+          if (m !== 'normal' && m !== 'inspection' && m !== 'alarm') {
+            throw new Error(`modo desconocido: ${m}`);
+          }
+          setMode(m);
+          appendLog(`Modo cambiado a ${m}`);
+          break;
+        }
+        case 'trigger_alarm': {
+          setMode('alarm');
+          setAlarmOn(true);
+          appendLog('ALARMA ACTIVADA');
+          break;
+        }
+        case 'stop_alarm': {
+          setAlarmOn(false);
+          setMode('normal');
+          appendLog('Alarma detenida');
+          break;
+        }
+        case 'set_thresholds': {
+          const g = Number(params.impactG);
+          if (!Number.isFinite(g) || g <= 0) throw new Error('impactG invalido');
+          setImpactThresholdG(String(g));
+          appendLog(`Umbral de impacto ajustado a ${g} g`);
+          break;
+        }
+        case 'toggle_sensor': {
+          // Los sensores se activan segun disponibilidad real del
+          // dispositivo (Fase 2); apagarlos a mano queda pendiente.
+          throw new Error('toggle_sensor no implementado todavia');
+        }
+        default:
+          throw new Error(`accion no soportada: ${action}`);
+      }
+
+      cmdVistosRef.current.add(cmdId);
+      publishAck(cmdId, 'executed');
+    } catch (err) {
+      const motivo = err instanceof Error ? err.message : String(err);
+      appendLog(`Comando ${action} rechazado: ${motivo}`);
+      publishAck(cmdId, 'rejected', motivo);
+    }
+  }
+
   function publishHeartbeat() {
     const client = clientRef.current;
     if (!client || status !== 'connected') return;
@@ -815,6 +971,10 @@ export default function NodoScreen() {
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       <Text style={styles.title}>Modo Nodo</Text>
+
+      {alarmOn ? (
+        <Text style={styles.alarmBanner}>ALARMA ACTIVA — comando del centro de control</Text>
+      ) : null}
 
       <Text style={styles.sectionLabel}>Acelerómetro</Text>
       <Text style={styles.reading}>
@@ -968,6 +1128,17 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   spacer: { height: 8 },
   movementBadge: { textAlign: 'center', fontWeight: '700', fontSize: 13, marginBottom: 8 },
+  alarmBanner: {
+    backgroundColor: '#b8433f',
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 13,
+    textAlign: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    marginBottom: 10,
+  },
   movementHint: { fontWeight: '400', opacity: 0.6, fontSize: 11 },
   status: { marginTop: 16, fontWeight: '600', color: '#111111' },
   logLine: { fontSize: 11, color: '#666666' },
