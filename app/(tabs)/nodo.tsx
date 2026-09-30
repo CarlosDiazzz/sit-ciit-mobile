@@ -280,29 +280,31 @@ export default function NodoScreen() {
     const accelDev = Math.abs(magnitude(m) - 1.0);
     const gyroMag = g ? gyroMagnitude(g) : 0;
 
-    // Filtro EMA de energía cinética (sensible a traslación, giros y vibración del vehículo)
-    const instantEnergy = Math.max(0, accelDev - 0.025) * 1.5 + Math.max(0, gyroMag - 0.08) * 0.5;
-    kineticEnergyRef.current = kineticEnergyRef.current * 0.70 + instantEnergy * 0.30;
+    // Filtro atenuado: no sobre-amplifica sacudidas bruscas (filtro 80/20)
+    const instantEnergy = Math.max(0, accelDev - 0.04) * 0.7 + Math.max(0, gyroMag - 0.12) * 0.25;
+    kineticEnergyRef.current = kineticEnergyRef.current * 0.80 + instantEnergy * 0.20;
     const energy = kineticEnergyRef.current;
 
-    // Si la energía supera el umbral de ruido estático (0.035 g)
+    // Parámetros de calibración moderados (evitan disparos excesivos):
+    const SPEED_SCALE = 55;      // factor moderado (antes 115)
+    const MAX_INERTIAL_KMH = 45; // tope máximo realista para demo (antes 80)
+    const ACCEL_RATE = 1.2;      // inercia al acelerar (simula masa de tren, antes 3.0)
+    const BRAKE_RATE = 1.5;      // inercia al frenar
+
     let targetSpeedKmh = 0;
-    if (energy > 0.035) {
-      // Mapeo proporcional a dinámica de transporte:
-      // Movimiento suave en mano/caminar: ~15-25 km/h
-      // Movimiento sostenido/transporte: ~35-55 km/h
-      // Movimiento vigoroso/curva rápida: hasta 80 km/h (límite operativo Línea Z)
-      targetSpeedKmh = Math.min(80, (energy - 0.035) * 115);
+    if (energy > 0.03) {
+      // Movimiento suave: 5-15 km/h, sostenido/caminando: 15-30 km/h, tope: 45 km/h
+      targetSpeedKmh = Math.min(MAX_INERTIAL_KMH, (energy - 0.03) * SPEED_SCALE);
     }
 
     let currentKmh = inertialSpeedKmhRef.current;
     if (targetSpeedKmh > currentKmh) {
-      // Aceleración: reacción dinámica en ~0.5 s
-      currentKmh += (targetSpeedKmh - currentKmh) * Math.min(1.0, dt * 3.0);
+      // Aceleración con inercia de masa realista
+      currentKmh += (targetSpeedKmh - currentKmh) * Math.min(1.0, dt * ACCEL_RATE);
     } else {
-      // Desaceleración / frenado: inercia gradual (se toma ~1.5 - 2 s en llegar a 0)
-      currentKmh -= (currentKmh - targetSpeedKmh) * Math.min(1.0, dt * 1.8);
-      if (currentKmh < 0.3) currentKmh = 0;
+      // Desaceleración progresiva
+      currentKmh -= (currentKmh - targetSpeedKmh) * Math.min(1.0, dt * BRAKE_RATE);
+      if (currentKmh < 0.2) currentKmh = 0;
     }
     inertialSpeedKmhRef.current = currentKmh;
 
