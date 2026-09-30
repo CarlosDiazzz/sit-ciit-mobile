@@ -19,6 +19,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { Text, View } from '@/components/Themed';
 import SpeedGauge from '@/src/components/SpeedGauge';
 import {
+  DetectorDinamico,
+  UMBRALES_POR_DEFECTO,
+  type EventoDinamico,
+} from '@/src/lib/deteccionDinamica';
+import {
   MedidorFrecuencia,
   anguloDesdeReferencia,
   magnitudDinamica,
@@ -29,6 +34,8 @@ import {
   CONTRACT_VERSION,
   isActionAllowedForRole,
   type CmdAction,
+  type EventKind,
+  type EventSeverity,
   type IssuerRole,
 } from '@/src/contract/contract';
 
@@ -46,8 +53,9 @@ type Status = 'idle' | 'connecting' | 'connected' | 'error';
 type NodeRole = 'primary' | 'backup';
 type LocationPermission = 'unknown' | 'granted' | 'denied';
 type NodeMode = 'normal' | 'inspection' | 'alarm';
-type EventKind = 'impact' | 'door_open' | 'door_closed' | 'rollover' | 'threshold_exceeded';
-type EventSeverity = 'info' | 'warning' | 'critical';
+// Se importan del contrato en vez de redeclararse: la copia local se
+// quedo en los cinco eventos originales y no vio los de dinamica que
+// agrego el v1.2.0.
 
 interface GpsReading {
   lat: number;
@@ -194,6 +202,12 @@ export default function NodoScreen() {
   // Android entrega lo que el hardware permite.
   const medidorAccelRef = useRef(new MedidorFrecuencia());
   const [hzReal, setHzReal] = useState<number | null>(null);
+  // Detector de dinamica de marcha: se alimenta con cada muestra del
+  // bucle de deteccion (no con las publicadas) porque un frenado o un
+  // golpe de via duran decimas de segundo.
+  const detectorRef = useRef(new DetectorDinamico());
+  const [ejeAprendido, setEjeAprendido] = useState(false);
+  const [ultimoDinamico, setUltimoDinamico] = useState<string | null>(null);
   const calibrandoRef = useRef(false);
   const anguloRef = useRef<number | null>(null);
 
@@ -204,6 +218,7 @@ export default function NodoScreen() {
       if (readingRef.current) setReading(readingRef.current);
       setLastRolloverAngle(anguloRef.current);
       setHzReal(medidorAccelRef.current.hz);
+      setEjeAprendido(detectorRef.current.tieneEjeAvance);
     }, UI_REFRESH_MS);
     return () => clearInterval(id);
   }, []);
@@ -463,6 +478,17 @@ export default function NodoScreen() {
 
         const dinamica = magnitudDinamica(m, referenceGravityRef.current);
         movementEmaRef.current = movementEmaRef.current * 0.7 + dinamica * 0.3;
+
+        // Dinamica de marcha: frenado, curva, golpe con eje e
+        // irregularidad de via. Se alimenta con cada muestra; el
+        // detector lleva su propia histeresis y tiempo de espera.
+        const evDin = detectorRef.current.procesar({
+          accel: m,
+          gravedadRef: referenceGravityRef.current,
+          velocidadMs: gpsRef.current?.speedMs ?? null,
+          ahora: Date.now(),
+        });
+        if (evDin) emitirEventoDinamico(evDin);
         evaluateMovement();
         updateInertialSpeed(m);
 
@@ -973,6 +999,16 @@ export default function NodoScreen() {
       appendLog(`Comando ${action} rechazado: ${motivo}`);
       publishAck(cmdId, 'rejected', motivo);
     }
+  }
+
+  /** Publica un evento de dinamica como mensaje `event` del contrato
+   *  v1.2.0. El eje del golpe va en el log local: el contrato no tiene
+   *  campo para el (se evaluara en un 1.3.0 si resulta util). */
+  function emitirEventoDinamico(ev: EventoDinamico) {
+    const detalle = 'eje' in ev ? ` (${ev.eje})` : '';
+    appendLog(`${ev.kind}${detalle}: ${ev.value.toFixed(2)} g`);
+    setUltimoDinamico(`${ev.kind}${detalle} ${ev.value.toFixed(2)} g`);
+    publishEvent(ev.kind, ev.severity, ev.value, ev.threshold);
   }
 
   function publishHeartbeat() {
