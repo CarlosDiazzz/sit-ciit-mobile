@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, ScrollView, StyleSheet, Switch, TextInput, Vibration } from 'react-native';
+import { Vibration } from 'react-native';
 import {
   Accelerometer,
   Barometer,
@@ -17,8 +17,8 @@ import { useBatteryLevel } from 'expo-battery';
 import mqtt, { type MqttClient } from 'mqtt';
 import { v4 as uuidv4 } from 'uuid';
 
-import { Text, View } from '@/components/Themed';
-import SpeedGauge from '@/src/components/SpeedGauge';
+import NodeDashboard from '@/src/components/NodeDashboard';
+import NodeSettings from '@/src/components/NodeSettings';
 import {
   abrirOutbox,
   confirmar as confirmarEnvio,
@@ -1231,129 +1231,7 @@ export default function NodoScreen() {
     return () => clearInterval(id);
   }, [status, nodeId, unitId, role, nodeSecret]);
 
-  return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
-      <Text style={styles.title}>Modo Nodo</Text>
-
-      {alarmOn ? (
-        <Text style={styles.alarmBanner}>ALARMA ACTIVA — comando del centro de control</Text>
-      ) : null}
-
-      <Text style={styles.sectionLabel}>
-        Acelerómetro{hzReal != null ? ` — ${hzReal.toFixed(0)} Hz reales` : ''}
-      </Text>
-      <Text style={styles.reading}>
-        {accelAvailable === false
-          ? 'No disponible en este dispositivo'
-          : reading
-            ? `x=${reading.x.toFixed(3)}  y=${reading.y.toFixed(3)}  z=${reading.z.toFixed(3)}  |g|=${magnitude(reading).toFixed(3)}`
-            : 'Esperando lecturas...'}
-      </Text>
-
-      <Text style={styles.sectionLabel}>GPS y Velocidad</Text>
-      <Text style={styles.reading}>
-        {locationPermission === 'denied'
-          ? 'Permiso de ubicación denegado'
-          : locationPermission === 'unknown'
-            ? 'Pidiendo permiso...'
-            : gps
-              ? `${gps.speedMs != null && gps.speedMs >= 0 ? `${(gps.speedMs * 3.6).toFixed(1)} km/h` : '0.0 km/h'}` +
-                `${gps.speedSource === 'inercial' ? ' (fusión inercial)' : gps.speedSource === 'posicion' ? ' (por posición)' : gps.speedSource === 'gps' ? ' (satelital)' : ''}` +
-                `  (±${gps.accuracyM?.toFixed(0) ?? '?'} m, fix ${new Date(gps.fixTimestamp).toLocaleTimeString()})`
-              : 'Esperando fix de GPS...'}
-      </Text>
-      <SpeedGauge
-        speedKmh={gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : 0}
-        label={
-          gps?.speedSource === 'inercial'
-            ? 'inercial (fusión)'
-            : gps?.speedSource === 'posicion'
-              ? 'estimada'
-              : gps?.speedSource === 'gps'
-                ? 'satelital'
-                : undefined
-        }
-      />
-      <Text style={[styles.movementBadge, { color: isMoving ? '#0ca30c' : '#898781' }]}>
-        {isMoving ? '● en movimiento' : '○ quieto'}
-        <Text style={styles.movementHint}>
-          {gps?.speedSource === 'inercial' ? ' (fusión inercial continua)' : ' (acelerómetro + giroscopio)'}
-        </Text>
-      </Text>
-      <TextInput
-        style={styles.input} placeholderTextColor="#999999"
-        value={gpsIntervalMs}
-        onChangeText={setGpsIntervalMs}
-        keyboardType="numeric"
-        placeholder="ms entre lecturas de GPS (5000 = 5s)"
-      />
-
-      {configured === null ? (
-        <Text style={styles.reading}>Cargando configuración guardada...</Text>
-      ) : configured ? (
-        <>
-          <Text style={styles.sectionLabel}>Nodo configurado</Text>
-          <Text style={styles.reading}>
-            {nodeId} ({unitId}, {role === 'primary' ? 'primario' : 'respaldo'})
-          </Text>
-          <Button title="Reconfigurar" onPress={reconfigurar} />
-        </>
-      ) : (
-        <>
-          <Text style={styles.sectionLabel}>Identidad del nodo</Text>
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeId} onChangeText={setNodeId} placeholder="nodeId" autoCapitalize="none" />
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={unitId} onChangeText={setUnitId} placeholder="unitId" autoCapitalize="none" />
-          <View style={styles.row}>
-            <Text>Rol: {role}</Text>
-            <Switch value={isBackup} onValueChange={setIsBackup} />
-          </View>
-          {/* Lo genera el CRUD de Nodos en el dashboard (rol control_center)
-              — se pega una sola vez, aquí, y luego se guarda cifrado en el
-              celular; ver contrato v1.3.0. */}
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={nodeSecret} onChangeText={setNodeSecret} placeholder="secreto del nodo (dashboard → Nodos)" secureTextEntry autoCapitalize="none" />
-
-          <Text style={styles.sectionLabel}>Conexión MQTT</Text>
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={brokerUrl} onChangeText={setBrokerUrl} placeholder="ws://<ip>:9001" autoCapitalize="none" />
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={username} onChangeText={setUsername} placeholder="usuario" autoCapitalize="none" />
-          <TextInput style={styles.input} placeholderTextColor="#999999" value={password} onChangeText={setPassword} placeholder="contraseña" secureTextEntry autoCapitalize="none" />
-
-          <Button title="Guardar y conectar" onPress={guardarYConectar} disabled={status === 'connecting' || !nodeSecret} />
-        </>
-      )}
-      <View style={styles.spacer} />
-      <Button title="Desconectar" onPress={disconnect} disabled={status === 'idle'} />
-
-      <Text style={styles.sectionLabel}>Muestreo</Text>
-      <TextInput
-        style={styles.input} placeholderTextColor="#999999"
-        value={samplingMs}
-        onChangeText={setSamplingMs}
-        keyboardType="numeric"
-        placeholder="ms entre lecturas"
-      />
-      <View style={styles.row}>
-        <Text>Publicar automáticamente</Text>
-        <Switch value={autoPublish} onValueChange={setAutoPublish} disabled={status !== 'connected'} />
-      </View>
-      <View style={styles.spacer} />
-      <Button title="Publicar una vez" onPress={publishTelemetry} disabled={status !== 'connected'} />
-
-      <Text style={styles.sectionLabel}>Eventos en el borde</Text>
-      <Text style={styles.reading}>
-        Volcadura: {lastRolloverAngle != null ? `${lastRolloverAngle.toFixed(0)}°` : '—'} respecto a la vertical
-        {rolloverSinceRef.current != null ? ' (sostenido...)' : ''}
-      </Text>
-      <TextInput
-        style={styles.input} placeholderTextColor="#999999"
-        value={impactThresholdG}
-        onChangeText={setImpactThresholdG}
-        keyboardType="numeric"
-        placeholder="umbral de impacto en g (2.5 = default)"
-      />
-      <Button
-        title={calibrando ? 'Calibrando, mantén el equipo quieto…' : 'Calibrar en reposo (vertical + giroscopio)'}
-        disabled={calibrando}
-        onPress={() => {
+  function calibrarEnReposo() {
           // Promediar varias muestras en reposo, en vez de tomar una
           // sola: una lectura suelta arrastra el ruido del sensor a la
           // referencia, y todo lo demás se mide contra ella.
@@ -1384,72 +1262,28 @@ export default function NodoScreen() {
                 : 'No se pudo calibrar: sin lecturas del acelerómetro'
             );
           }, CALIB_MUESTRAS * 20 + 500);
-        }}
+  }
+
+  return (
+    <NodeDashboard data={{
+      nodeId, unitId, status, reading,
+      speed: gps?.speedMs != null && gps.speedMs >= 0 ? gps.speedMs * 3.6 : null,
+      speedLabel: gps?.speedSource === 'inercial' ? 'Estimación inercial · No es velocidad GPS' : gps?.speedSource === 'posicion' ? 'Estimada por posición' : gps?.speedSource === 'gps' ? 'Velocidad satelital' : 'Esperando velocidad GPS',
+      moving: isMoving, battery: batteryLevel >= 0 ? batteryLevel : null,
+      pending: pendientes, hz: hzReal, angle: lastRolloverAngle,
+      lux, pressure: pressureHpa, mag: magReading, door: doorStateRef.current,
+      gps, alarm: alarmOn, log, lastEvent: ultimoDinamico, locationPermission,
+      availability: [{ name: 'Acelerómetro', available: accelAvailable }, { name: 'Giroscopio', available: gyroAvailable }, { name: 'Luz', available: lightAvailable }, { name: 'Barómetro', available: barometerAvailable }, { name: 'Magnetómetro', available: magAvailable }],
+    }}>
+      <NodeSettings
+        values={{ nodeId, unitId, nodeSecret, brokerUrl, username, password, gpsIntervalMs, samplingMs, impactThresholdG, doorOpenLux, doorClosedLux }}
+        onChange={(key, value) => ({ nodeId: setNodeId, unitId: setUnitId, nodeSecret: setNodeSecret, brokerUrl: setBrokerUrl, username: setUsername, password: setPassword, gpsIntervalMs: setGpsIntervalMs, samplingMs: setSamplingMs, impactThresholdG: setImpactThresholdG, doorOpenLux: setDoorOpenLux, doorClosedLux: setDoorClosedLux })[key](value)}
+        configured={configured} status={status} isBackup={isBackup} autoPublish={autoPublish} calibrando={calibrando}
+        setIsBackup={setIsBackup} setAutoPublish={setAutoPublish}
+        onSave={guardarYConectar} onReconfigure={reconfigurar} onDisconnect={disconnect}
+        onPublish={publishTelemetry} onCalibrate={calibrarEnReposo}
+        angle={lastRolloverAngle} sustained={rolloverSinceRef.current != null}
       />
-
-      <Text style={styles.reading}>
-        Luz: {lightAvailable === false ? 'no disponible en este dispositivo' : lux != null ? `${lux.toFixed(0)} lx` : 'esperando...'}
-        {'  '}puerta: {doorStateRef.current ?? '¿?'}
-      </Text>
-      <View style={styles.row}>
-        <TextInput
-          style={[styles.input, styles.halfInput]} placeholderTextColor="#999999"
-          value={doorOpenLux}
-          onChangeText={setDoorOpenLux}
-          keyboardType="numeric"
-          placeholder="lux: abierta arriba de"
-        />
-        <TextInput
-          style={[styles.input, styles.halfInput]} placeholderTextColor="#999999"
-          value={doorClosedLux}
-          onChangeText={setDoorClosedLux}
-          keyboardType="numeric"
-          placeholder="lux: cerrada abajo de"
-        />
-      </View>
-
-      <Text style={styles.reading}>
-        Presión: {barometerAvailable === false ? 'no disponible en este dispositivo' : pressureHpa != null ? `${pressureHpa.toFixed(1)} hPa` : 'esperando...'}
-      </Text>
-
-      <Text style={styles.reading}>
-        Magnetómetro: {magAvailable === false ? 'no disponible en este dispositivo' : magReading != null ? `x=${magReading.x.toFixed(1)}  y=${magReading.y.toFixed(1)}  z=${magReading.z.toFixed(1)} µT` : 'esperando...'}
-      </Text>
-
-      <Text style={styles.status}>Estado: {status}</Text>
-      {log.map((line, i) => (
-        <Text key={i} style={styles.logLine}>
-          {line}
-        </Text>
-      ))}
-    </ScrollView>
+    </NodeDashboard>
   );
 }
-
-const styles = StyleSheet.create({
-  // Colores explicitos: no depender del tema del sistema (ver app/_layout.tsx).
-  container: { flex: 1, backgroundColor: '#ffffff' },
-  scrollContent: { padding: 16, paddingTop: 50, paddingBottom: 60 },
-  title: { fontSize: 18, fontWeight: 'bold', marginBottom: 8, color: '#111111' },
-  sectionLabel: { fontSize: 13, fontWeight: '600', marginTop: 12, marginBottom: 4, color: '#555555' },
-  reading: { fontVariant: ['tabular-nums'], fontSize: 14, color: '#111111' },
-  input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 6, padding: 8, marginBottom: 6, color: '#111111', backgroundColor: '#ffffff' },
-  halfInput: { flex: 1, marginRight: 6 },
-  row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
-  spacer: { height: 8 },
-  movementBadge: { textAlign: 'center', fontWeight: '700', fontSize: 13, marginBottom: 8 },
-  alarmBanner: {
-    backgroundColor: '#b8433f',
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 13,
-    textAlign: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    marginBottom: 10,
-  },
-  movementHint: { fontWeight: '400', opacity: 0.6, fontSize: 11 },
-  status: { marginTop: 16, fontWeight: '600', color: '#111111' },
-  logLine: { fontSize: 11, color: '#666666' },
-});
