@@ -11,7 +11,6 @@ export function useAnimatedNumber(target: number | null, durationMs = 800): numb
 
   useEffect(() => {
     if (target == null) {
-      setDisplay(null);
       fromRef.current = null;
       return;
     }
@@ -35,8 +34,7 @@ export function useAnimatedNumber(target: number | null, durationMs = 800): numb
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target, durationMs]);
 
-  return display;
+  return target == null ? null : display;
 }
