@@ -19,6 +19,16 @@ import { v4 as uuidv4 } from 'uuid';
 import { Text, View } from '@/components/Themed';
 import SpeedGauge from '@/src/components/SpeedGauge';
 import {
+  abrirOutbox,
+  confirmar as confirmarEnvio,
+  descartar,
+  encolar,
+  estado as estadoOutbox,
+  marcarIntento,
+  siguienteLote,
+  type TipoMensaje,
+} from '@/src/lib/outbox';
+import {
   DetectorDinamico,
   UMBRALES_POR_DEFECTO,
   type EventoDinamico,
@@ -200,6 +210,12 @@ export default function NodoScreen() {
   // Android entrega lo que el hardware permite.
   const medidorAccelRef = useRef(new MedidorFrecuencia());
   const [hzReal, setHzReal] = useState<number | null>(null);
+  // Cola de salida: lo pendiente de entregar. Se reporta en el
+  // heartbeat (pendingOutbox del contrato) y se ve en pantalla.
+  const [pendientes, setPendientes] = useState(0);
+  const pendientesRef = useRef(0);
+  pendientesRef.current = pendientes;
+  const drenandoRef = useRef(false);
   // Detector de dinamica de marcha: se alimenta con cada muestra del
   // bucle de deteccion (no con las publicadas) porque un frenado o un
   // golpe de via duran decimas de segundo.
@@ -411,7 +427,8 @@ export default function NodoScreen() {
    *  deps más abajo), así que no quedan viejos como en un closure normal. */
   function publishEvent(kind: EventKind, severity: EventSeverity, value?: number, threshold?: number) {
     const client = clientRef.current;
-    if (!client || status !== 'connected') return;
+    // Sin guarda de conexion: el mensaje va a la cola y sale cuando
+    // haya red. Esa guarda era justo lo que perdia los eventos.
 
     seqRef.current += 1;
     const g = gpsRef.current;
@@ -431,10 +448,9 @@ export default function NodoScreen() {
       ...(g ? { gps: { lat: g.lat, lon: g.lon } } : {}),
     });
 
-    client.publish(`sitciit/${nodeId}/event`, payload, { qos: 1 }, (err) => {
-      if (err) appendLog(`Fallo al publicar evento ${kind}: ${err.message}`);
-      else appendLog(`Evento: ${kind} (${severity})`);
-    });
+    // A la cola en vez de directo: un impacto detectado en un tunel se
+    // perdia porque publishEvent salia temprano sin conexion.
+    void encolarMensaje(`sitciit/${nodeId}/event`, payload, 'event');
   }
 
   // Disponibilidad de los sensores (se checa una vez).
@@ -813,7 +829,7 @@ export default function NodoScreen() {
   function publishTelemetry() {
     const client = clientRef.current;
     const m = readingRef.current;
-    if (!client || status !== 'connected' || !m) return;
+    if (!m) return;
 
     seqRef.current += 1;
     const g = gpsRef.current;
@@ -854,10 +870,7 @@ export default function NodoScreen() {
         : {}),
     });
 
-    client.publish(`sitciit/${nodeId}/telemetry`, payload, { qos: 1 }, (err) => {
-      if (err) appendLog(`Fallo al publicar seq=${seqRef.current}: ${err.message}`);
-      else appendLog(`Publicado seq=${seqRef.current}`);
-    });
+    void encolarMensaje(`sitciit/${nodeId}/telemetry`, payload, 'telemetry');
   }
 
   // Auto-publicación al ritmo de samplingMs mientras está conectado.
@@ -994,6 +1007,90 @@ export default function NodoScreen() {
     }
   }
 
+
+  /** Encola un mensaje saliente. Nada se publica directo: si no hay
+   *  conexion, el mensaje espera en SQLite en vez de perderse. */
+  async function encolarMensaje(topic: string, payload: string, tipo: TipoMensaje) {
+    try {
+      await encolar(topic, payload, tipo);
+      const e = await estadoOutbox();
+      setPendientes(e.total);
+      void drenar();
+    } catch (err) {
+      appendLog(`No se pudo encolar ${tipo}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  /** Vacia la cola por lotes mientras haya conexion. Un mensaje solo se
+   *  borra cuando el broker confirma (QoS 1): si el envio falla a mitad,
+   *  al reconectar se retoma donde quedo. */
+  async function drenar() {
+    if (drenandoRef.current) return;
+    const client = clientRef.current;
+    if (!client || !client.connected) return;
+
+    drenandoRef.current = true;
+    try {
+      for (;;) {
+        const lote = await siguienteLote();
+        if (lote.length === 0) break;
+
+        for (const m of lote) {
+          if (!clientRef.current?.connected) return;
+
+          const ok = await new Promise<boolean>((resolve) => {
+            clientRef.current!.publish(m.topic, m.payload, { qos: 1 }, (err) =>
+              resolve(!err),
+            );
+          });
+
+          if (ok) {
+            await confirmarEnvio(m.id);
+          } else {
+            await marcarIntento(m.id);
+            // Tras varios fallos el payload es el problema, no la red:
+            // se descarta para que no bloquee lo que viene detras.
+            if (m.intentos >= 4) {
+              await descartar(m.id);
+              appendLog(`Descartado un ${m.tipo} tras 5 intentos fallidos`);
+            }
+            return; // sin red: se reintenta al reconectar
+          }
+        }
+      }
+    } catch (err) {
+      appendLog(`Error vaciando la cola: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      drenandoRef.current = false;
+      const e = await estadoOutbox();
+      setPendientes(e.total);
+    }
+  }
+
+  // Abre la cola al arrancar y reporta lo que quedo pendiente de una
+  // sesion anterior (la app pudo cerrarse sin cobertura).
+  useEffect(() => {
+    void (async () => {
+      try {
+        await abrirOutbox();
+        const e = await estadoOutbox();
+        setPendientes(e.total);
+        if (e.total > 0) {
+          appendLog(`${e.total} mensajes pendientes de la sesion anterior`);
+        }
+      } catch (err) {
+        appendLog(`No se pudo abrir la cola: ${err instanceof Error ? err.message : err}`);
+      }
+    })();
+  }, []);
+
+  // Reintento periodico: cubre el caso de recuperar la red sin que el
+  // cliente MQTT emita 'connect' (por ejemplo al volver de segundo plano).
+  useEffect(() => {
+    const id = setInterval(() => void drenar(), 5000);
+    return () => clearInterval(id);
+  }, []);
+
   /** Publica un evento de dinamica como mensaje `event` del contrato
    *  v1.2.0. El eje del golpe va en el log local: el contrato no tiene
    *  campo para el (se evaluara en un 1.3.0 si resulta util). */
@@ -1006,7 +1103,7 @@ export default function NodoScreen() {
 
   function publishHeartbeat() {
     const client = clientRef.current;
-    if (!client || status !== 'connected') return;
+    // Sin guarda de conexion: a la cola (ver encolarMensaje).
 
     seqRef.current += 1;
     const level = batteryLevelRef.current;
@@ -1023,7 +1120,7 @@ export default function NodoScreen() {
       // dispositivo no reporta nivel de batería (ver expo-battery) — el
       // contrato no acepta negativos, así que se omite en vez de mandarlo.
       ...(level != null && level >= 0 ? { batteryPct: Math.round(level * 100) } : {}),
-      pendingOutbox: 0, // no hay outbox todavía (Fase 3)
+      pendingOutbox: pendientesRef.current,
       samplingMs: Number(samplingMs) || DEFAULT_SAMPLING_MS,
       capabilities: capabilitiesRef.current,
       mode: modeRef.current,
@@ -1031,9 +1128,7 @@ export default function NodoScreen() {
 
     // Heartbeat no se registra en el log de UI (saldría uno cada 5s
     // ahogando lo demás) — solo se avisa si falla.
-    client.publish(`sitciit/${nodeId}/heartbeat`, payload, { qos: 1 }, (err) => {
-      if (err) appendLog(`Fallo al publicar heartbeat: ${err.message}`);
-    });
+    void encolarMensaje(`sitciit/${nodeId}/heartbeat`, payload, 'heartbeat');
   }
 
   // El heartbeat es independiente de "Publicar automáticamente": el nodo
