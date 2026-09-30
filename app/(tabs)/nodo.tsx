@@ -393,67 +393,85 @@ export default function NodoScreen() {
   // los lee directo (no por ref) — se reinicia la suscripción cuando
   // cambian, así siempre están frescos dentro del listener.
   useEffect(() => {
-    const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
-    Accelerometer.setUpdateInterval(intervalMs);
-    const sub = Accelerometer.addListener((m) => {
-      readingRef.current = m;
-      setReading(m);
-      movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
-      evaluateMovement();
-      updateInertialSpeed(m, gyroReadingRef.current);
+    let sub: { remove: () => void } | null = null;
+    try {
+      const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
+      Accelerometer.setUpdateInterval(intervalMs);
+      sub = Accelerometer.addListener((m) => {
+        readingRef.current = m;
+        setReading(m);
+        movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
+        evaluateMovement();
+        updateInertialSpeed(m, gyroReadingRef.current);
 
-      // Impacto: flanco de subida sobre el umbral, no repite mientras
-      // se mantenga arriba.
-      const mag = magnitude(m);
-      const impactThreshold = Number(impactThresholdG) || DEFAULT_IMPACT_THRESHOLD_G;
-      const aboveImpact = mag > impactThreshold;
-      if (aboveImpact && !wasAboveImpactRef.current) {
-        const severity: EventSeverity =
-          mag > impactThreshold * IMPACT_CRITICAL_MULTIPLIER ? 'critical' : 'warning';
-        publishEvent('impact', severity, mag, impactThreshold);
-      }
-      wasAboveImpactRef.current = aboveImpact;
-
-      // Volcadura: primera lectura calibra "vertical"; después se mide
-      // el ángulo respecto a esa referencia (se puede recalibrar a mano).
-      if (!referenceGravityRef.current) {
-        referenceGravityRef.current = m;
-      } else {
-        const angle = angleFromReferenceDeg(m, referenceGravityRef.current);
-        setLastRolloverAngle(angle);
-        if (angle > ROLLOVER_ANGLE_DEG) {
-          if (rolloverSinceRef.current == null) {
-            rolloverSinceRef.current = Date.now();
-          } else if (
-            !rolloverFiredRef.current &&
-            Date.now() - rolloverSinceRef.current >= ROLLOVER_SUSTAIN_MS
-          ) {
-            rolloverFiredRef.current = true;
-            publishEvent('rollover', 'critical', angle, ROLLOVER_ANGLE_DEG);
-          }
-        } else {
-          rolloverSinceRef.current = null;
-          rolloverFiredRef.current = false;
+        // Impacto: flanco de subida sobre el umbral, no repite mientras
+        // se mantenga arriba.
+        const mag = magnitude(m);
+        const impactThreshold = Number(impactThresholdG) || DEFAULT_IMPACT_THRESHOLD_G;
+        const aboveImpact = mag > impactThreshold;
+        if (aboveImpact && !wasAboveImpactRef.current) {
+          const severity: EventSeverity =
+            mag > impactThreshold * IMPACT_CRITICAL_MULTIPLIER ? 'critical' : 'warning';
+          publishEvent('impact', severity, mag, impactThreshold);
         }
-      }
-    });
-    return () => sub.remove();
+        wasAboveImpactRef.current = aboveImpact;
+
+        // Volcadura: primera lectura calibra "vertical"; después se mide
+        // el ángulo respecto a esa referencia (se puede recalibrar a mano).
+        if (!referenceGravityRef.current) {
+          referenceGravityRef.current = m;
+        } else {
+          const angle = angleFromReferenceDeg(m, referenceGravityRef.current);
+          setLastRolloverAngle(angle);
+          if (angle > ROLLOVER_ANGLE_DEG) {
+            if (rolloverSinceRef.current == null) {
+              rolloverSinceRef.current = Date.now();
+            } else if (
+              !rolloverFiredRef.current &&
+              Date.now() - rolloverSinceRef.current >= ROLLOVER_SUSTAIN_MS
+            ) {
+              rolloverFiredRef.current = true;
+              publishEvent('rollover', 'critical', angle, ROLLOVER_ANGLE_DEG);
+            }
+          } else {
+            rolloverSinceRef.current = null;
+            rolloverFiredRef.current = false;
+          }
+        }
+      });
+    } catch {
+      // Sensor no disponible en este hardware
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {}
+    };
   }, [samplingMs, status, nodeId, unitId, role, impactThresholdG]);
 
   // Suscripción al giroscopio real — misma frecuencia que el acelerómetro,
   // alimenta el indicador de movimiento y el estimador inercial de velocidad.
   useEffect(() => {
-    const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
-    Gyroscope.setUpdateInterval(intervalMs);
-    const sub = Gyroscope.addListener((g) => {
-      gyroReadingRef.current = g;
-      rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
-      evaluateMovement();
-      if (readingRef.current) {
-        updateInertialSpeed(readingRef.current, g);
-      }
-    });
-    return () => sub.remove();
+    let sub: { remove: () => void } | null = null;
+    try {
+      const intervalMs = Math.min(Number(samplingMs) || DEFAULT_SAMPLING_MS, 150);
+      Gyroscope.setUpdateInterval(intervalMs);
+      sub = Gyroscope.addListener((g) => {
+        gyroReadingRef.current = g;
+        rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
+        evaluateMovement();
+        if (readingRef.current) {
+          updateInertialSpeed(readingRef.current, g);
+        }
+      });
+    } catch {
+      // Sensor no disponible en este hardware
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {}
+    };
   }, [samplingMs]);
 
   // Suscripción a luz real — detecta apertura/cierre de la caja con
@@ -462,57 +480,84 @@ export default function NodoScreen() {
   // La primera lectura solo calibra el estado inicial, no publica evento
   // (no hay "cambio" real todavía, solo se está enterando de cómo empezó).
   useEffect(() => {
-    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
-    LightSensor.setUpdateInterval(intervalMs);
-    const sub = LightSensor.addListener(({ illuminance }) => {
-      setLux(illuminance);
+    let sub: { remove: () => void } | null = null;
+    try {
+      const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+      LightSensor.setUpdateInterval(intervalMs);
+      sub = LightSensor.addListener(({ illuminance }) => {
+        setLux(illuminance);
 
-      const openThreshold = Number(doorOpenLux) || DEFAULT_DOOR_OPEN_LUX;
-      const closedThreshold = Number(doorClosedLux) || DEFAULT_DOOR_CLOSED_LUX;
-      const candidate: 'open' | 'closed' | null =
-        illuminance > openThreshold ? 'open' : illuminance < closedThreshold ? 'closed' : null;
-      if (candidate === null) return; // en la banda de histéresis, no decide nada
+        const openThreshold = Number(doorOpenLux) || DEFAULT_DOOR_OPEN_LUX;
+        const closedThreshold = Number(doorClosedLux) || DEFAULT_DOOR_CLOSED_LUX;
+        const candidate: 'open' | 'closed' | null =
+          illuminance > openThreshold ? 'open' : illuminance < closedThreshold ? 'closed' : null;
+        if (candidate === null) return; // en la banda de histéresis, no decide nada
 
-      if (candidate !== doorPendingStateRef.current) {
-        doorPendingStateRef.current = candidate;
-        doorPendingSinceRef.current = Date.now();
-        return;
-      }
+        if (candidate !== doorPendingStateRef.current) {
+          doorPendingStateRef.current = candidate;
+          doorPendingSinceRef.current = Date.now();
+          return;
+        }
 
-      const elapsed = Date.now() - (doorPendingSinceRef.current ?? Date.now());
-      if (elapsed < DOOR_DEBOUNCE_MS || candidate === doorStateRef.current) return;
+        const elapsed = Date.now() - (doorPendingSinceRef.current ?? Date.now());
+        if (elapsed < DOOR_DEBOUNCE_MS || candidate === doorStateRef.current) return;
 
-      const eraElConocido = doorStateRef.current !== null;
-      doorStateRef.current = candidate;
-      if (eraElConocido) {
-        publishEvent(candidate === 'open' ? 'door_open' : 'door_closed', candidate === 'open' ? 'warning' : 'info', illuminance);
-      }
-    });
-    return () => sub.remove();
+        const eraElConocido = doorStateRef.current !== null;
+        doorStateRef.current = candidate;
+        if (eraElConocido) {
+          publishEvent(candidate === 'open' ? 'door_open' : 'door_closed', candidate === 'open' ? 'warning' : 'info', illuminance);
+        }
+      });
+    } catch {
+      // Sensor no disponible en este hardware
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {}
+    };
   }, [samplingMs, status, nodeId, unitId, role, doorOpenLux, doorClosedLux]);
 
   // Suscripción al barómetro real — solo enriquece telemetry (pressureHpa),
   // no genera eventos propios.
   useEffect(() => {
-    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
-    Barometer.setUpdateInterval(intervalMs);
-    const sub = Barometer.addListener(({ pressure }) => {
-      pressureRef.current = pressure;
-      setPressureHpa(pressure);
-    });
-    return () => sub.remove();
+    let sub: { remove: () => void } | null = null;
+    try {
+      const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+      Barometer.setUpdateInterval(intervalMs);
+      sub = Barometer.addListener(({ pressure }) => {
+        pressureRef.current = pressure;
+        setPressureHpa(pressure);
+      });
+    } catch {
+      // Sensor no disponible en este hardware
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {}
+    };
   }, [samplingMs]);
 
   // Suscripción al magnetómetro real — lectura cruda en µT (contrato v1.1.0),
   // no un rumbo/brújula.
   useEffect(() => {
-    const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
-    Magnetometer.setUpdateInterval(intervalMs);
-    const sub = Magnetometer.addListener((m) => {
-      magRef.current = m;
-      setMagReading(m);
-    });
-    return () => sub.remove();
+    let sub: { remove: () => void } | null = null;
+    try {
+      const intervalMs = Number(samplingMs) || DEFAULT_SAMPLING_MS;
+      Magnetometer.setUpdateInterval(intervalMs);
+      sub = Magnetometer.addListener((m) => {
+        magRef.current = m;
+        setMagReading(m);
+      });
+    } catch {
+      // Sensor no disponible en este hardware
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {}
+    };
   }, [samplingMs]);
 
   // Permiso + lectura del GPS real, por *polling activo* en vez de
