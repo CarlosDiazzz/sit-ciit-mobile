@@ -29,6 +29,16 @@ export interface CommandUpdate {
   occurredAt: number;
 }
 
+/** Cambio de estado de un nodo (se cayo o volvio) — ver
+ *  sit-ciit-backend/src/domain/ports/TelemetryBroadcaster.ts. nodeId y
+ *  unitId son codigos del contrato, no UUIDs. */
+export interface NodeStatusUpdate {
+  nodeId: string;
+  unitId: string;
+  role: 'primary' | 'backup';
+  isOnline: boolean;
+}
+
 let socket: Socket | null = null;
 let socketUrl: string | null = null;
 let socketToken: string | null = null;

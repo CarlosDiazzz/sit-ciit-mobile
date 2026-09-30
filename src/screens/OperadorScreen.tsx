@@ -12,6 +12,7 @@ import {
   closeOperatorSocket,
   type EventBroadcast,
   type CommandUpdate,
+  type NodeStatusUpdate,
 } from '@/src/lib/operatorSocket';
 import { OPERATOR_ALLOWED_ACTIONS, type CmdAction } from '@/src/contract/contract';
 
@@ -89,6 +90,10 @@ export default function OperadorScreen() {
     void cargarUnidades();
   }, [cargarUnidades]);
 
+  // --- Estado de la conexion en vivo (sin esto no habia forma de saber
+  // desde la pantalla si el socket seguia conectado o se habia caido). ---
+  const [socketStatus, setSocketStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
+
   // --- Alertas y avances de comando en vivo ---
   const [alertas, setAlertas] = useState<EventBroadcast[]>([]);
   const [ultimoComando, setUltimoComando] = useState<{ cmdId: string; targetNodeCode: string; action: CmdAction } | null>(
@@ -98,7 +103,18 @@ export default function OperadorScreen() {
 
   useEffect(() => {
     if (!session) return;
+    setSocketStatus('connecting');
     const socket = getOperatorSocket(session.apiUrl, session.token);
+
+    function onConnect() {
+      setSocketStatus('connected');
+    }
+    function onDisconnect() {
+      setSocketStatus('error');
+    }
+    function onConnectError() {
+      setSocketStatus('error');
+    }
 
     function onEvent(payload: EventBroadcast) {
       if (payload.severity === 'critical') {
@@ -111,12 +127,43 @@ export default function OperadorScreen() {
         !ultimoComando || payload.cmdId !== ultimoComando.cmdId ? prev : payload,
       );
     }
+    // El estado de /units es una foto del momento del login: sin esto,
+    // un nodo que se conecta o se cae despues se queda mostrado con el
+    // estado viejo para siempre (justo lo que se reporto como "aparecen
+    // sin conexion" sin ser en vivo).
+    function onNodeStatus(payload: NodeStatusUpdate) {
+      setUnidades((prev) =>
+        prev.map((u) =>
+          u.unitCode !== payload.unitId
+            ? u
+            : {
+                ...u,
+                nodes: u.nodes.map((n) =>
+                  n.nodeCode === payload.nodeId ? { ...n, isOnline: payload.isOnline } : n,
+                ),
+              },
+        ),
+      );
+    }
 
+    // Si el socket ya estaba conectado (se reutiliza el singleton entre
+    // remontajes), 'connect' no vuelve a disparar — hay que leer el
+    // estado actual, no solo esperar el proximo evento.
+    setSocketStatus(socket.connected ? 'connected' : 'connecting');
+
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect_error', onConnectError);
     socket.on('event', onEvent);
     socket.on('command:update', onCommandUpdate);
+    socket.on('node:status', onNodeStatus);
     return () => {
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect_error', onConnectError);
       socket.off('event', onEvent);
       socket.off('command:update', onCommandUpdate);
+      socket.off('node:status', onNodeStatus);
     };
     // ultimoComando cambia con cada envío; no hace falta reabrir el
     // socket por eso, solo que el closure de onCommandUpdate lo vea.
@@ -178,9 +225,31 @@ export default function OperadorScreen() {
         <BrandHeader />
         <Heading eyebrow="OPERADOR" title="Centro de operación" aside={session.user.email} />
 
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+          <View
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: 4,
+              backgroundColor: socketStatus === 'connected' ? c.green : socketStatus === 'connecting' ? c.gold : c.accent,
+            }}
+          />
+          <Text style={{ color: c.muted, fontSize: 12 }}>
+            {socketStatus === 'connected'
+              ? 'Conectado en vivo'
+              : socketStatus === 'connecting'
+                ? 'Conectando…'
+                : 'Sin conexión con el servidor — reintentando'}
+          </Text>
+        </View>
+
         <Card>
           <Heading title="Alertas en vivo" aside={`${alertas.length}`} />
-          {alertas.length === 0 ? (
+          {socketStatus !== 'connected' ? (
+            <Text style={{ color: c.muted, fontSize: 13 }}>
+              Esperando conexión con el servidor para recibir alertas en vivo…
+            </Text>
+          ) : alertas.length === 0 ? (
             <Text style={{ color: c.muted, fontSize: 13 }}>Sin alertas todavía. Aparecen en cuanto ocurre un evento real.</Text>
           ) : (
             alertas.map((a, i) => (
