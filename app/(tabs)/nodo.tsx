@@ -264,46 +264,41 @@ export default function NodoScreen() {
   }
 
   // Estimador inercial continuo de velocidad (fusión acelerómetro + giroscopio) —
-  // dead-reckoning para mantener telemetría viva durante la demo y en tramos
-  // sin satélites del Istmo (túneles, interiores, cañones).
+  // Aproximación de movimiento: las sacudidas no permiten medir velocidad real.
   const inertialSpeedKmhRef = useRef(0);
   const kineticEnergyRef = useRef(0);
   const lastInertialTimeRef = useRef(Date.now());
   const lastUiUpdateRef = useRef(0);
   const gyroReadingRef = useRef<GyroscopeMeasurement | null>(null);
 
-  function updateInertialSpeed(m: AccelerometerMeasurement, g?: GyroscopeMeasurement | null) {
+  function updateInertialSpeed(m: AccelerometerMeasurement) {
     const now = Date.now();
-    const dt = Math.min(1.0, Math.max(0.05, (now - lastInertialTimeRef.current) / 1000));
+    const dt = Math.min(1.0, Math.max(0, (now - lastInertialTimeRef.current) / 1000));
+    if (dt === 0) return;
     lastInertialTimeRef.current = now;
 
     const accelDev = Math.abs(magnitude(m) - 1.0);
-    const gyroMag = g ? gyroMagnitude(g) : 0;
-
-    // Filtro atenuado: no sobre-amplifica sacudidas bruscas (filtro 80/20)
-    const instantEnergy = Math.max(0, accelDev - 0.04) * 0.7 + Math.max(0, gyroMag - 0.12) * 0.25;
-    kineticEnergyRef.current = kineticEnergyRef.current * 0.80 + instantEnergy * 0.20;
+    // Los giros no añaden velocidad; limitar golpes y filtrar por tiempo real.
+    const instantEnergy = Math.min(0.6, Math.max(0, accelDev - 0.08)) * 0.45;
+    const filterWeight = 1 - Math.exp(-dt / 0.8);
+    kineticEnergyRef.current += (instantEnergy - kineticEnergyRef.current) * filterWeight;
     const energy = kineticEnergyRef.current;
 
-    // Parámetros de calibración moderados (evitan disparos excesivos):
-    const SPEED_SCALE = 55;      // factor moderado (antes 115)
-    const MAX_INERTIAL_KMH = 45; // tope máximo realista para demo (antes 80)
-    const ACCEL_RATE = 1.2;      // inercia al acelerar (simula masa de tren, antes 3.0)
-    const BRAKE_RATE = 1.5;      // inercia al frenar
+    // Aproximación conservadora para caminar sin velocidad GPS disponible.
+    const SPEED_SCALE = 22;
+    const MAX_INERTIAL_KMH = 8;
+    const ACCEL_RATE = 0.5;
+    const BRAKE_RATE = 1.5;
 
-    let targetSpeedKmh = 0;
-    if (energy > 0.03) {
-      // Movimiento suave: 5-15 km/h, sostenido/caminando: 15-30 km/h, tope: 45 km/h
-      targetSpeedKmh = Math.min(MAX_INERTIAL_KMH, (energy - 0.03) * SPEED_SCALE);
-    }
+    const targetSpeedKmh = Math.min(MAX_INERTIAL_KMH, Math.max(0, energy - 0.025) * SPEED_SCALE);
 
     let currentKmh = inertialSpeedKmhRef.current;
     if (targetSpeedKmh > currentKmh) {
-      // Aceleración con inercia de masa realista
-      currentKmh += (targetSpeedKmh - currentKmh) * Math.min(1.0, dt * ACCEL_RATE);
+      // Limitar la subida a 1 km/h por segundo.
+      currentKmh += Math.min(dt, (targetSpeedKmh - currentKmh) * (1 - Math.exp(-dt * ACCEL_RATE)));
     } else {
       // Desaceleración progresiva
-      currentKmh -= (currentKmh - targetSpeedKmh) * Math.min(1.0, dt * BRAKE_RATE);
+      currentKmh -= (currentKmh - targetSpeedKmh) * (1 - Math.exp(-dt * BRAKE_RATE));
       if (currentKmh < 0.2) currentKmh = 0;
     }
     inertialSpeedKmhRef.current = currentKmh;
@@ -404,7 +399,7 @@ export default function NodoScreen() {
         setReading(m);
         movementEmaRef.current = movementEmaRef.current * 0.7 + Math.abs(magnitude(m) - 1) * 0.3;
         evaluateMovement();
-        updateInertialSpeed(m, gyroReadingRef.current);
+        updateInertialSpeed(m);
 
         // Impacto: flanco de subida sobre el umbral, no repite mientras
         // se mantenga arriba.
@@ -463,7 +458,7 @@ export default function NodoScreen() {
         rotationEmaRef.current = rotationEmaRef.current * 0.7 + gyroMagnitude(g) * 0.3;
         evaluateMovement();
         if (readingRef.current) {
-          updateInertialSpeed(readingRef.current, g);
+          updateInertialSpeed(readingRef.current);
         }
       });
     } catch {
