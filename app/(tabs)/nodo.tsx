@@ -917,6 +917,19 @@ export default function NodoScreen() {
       ts: Date.now(),
       type: 'telemetry',
       accel: { x: m.x, y: m.y, z: m.z },
+      // El giroscopio se leia para detectar movimiento pero nunca se
+      // publicaba, asi que el dashboard no podia graficar la rotacion
+      // aunque el contrato la define desde v1.0.0. Se resta el sesgo
+      // medido al calibrar: parado rara vez marca cero exacto.
+      ...(gyroReadingRef.current
+        ? {
+            gyro: {
+              x: gyroReadingRef.current.x - (gyroBiasRef.current?.x ?? 0),
+              y: gyroReadingRef.current.y - (gyroBiasRef.current?.y ?? 0),
+              z: gyroReadingRef.current.z - (gyroBiasRef.current?.z ?? 0),
+            },
+          }
+        : {}),
       ...(magRef.current
         ? {
             mag: {
