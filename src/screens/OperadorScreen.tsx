@@ -57,6 +57,7 @@ export default function OperadorScreen() {
 
   // --- Login ---
   const [email, setEmail] = useState('');
+  const [publicUrl, setPublicUrl] = useState<string | null>(null);
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
@@ -115,10 +116,13 @@ export default function OperadorScreen() {
   const [avanceComando, setAvanceComando] = useState<CommandUpdate | null>(null);
 
   useEffect(() => {
-    if (!session) return;
-    const socket = getOperatorSocket(session.apiUrl, session.token);
+    if (loading) return;
+    const url = session?.apiUrl ?? publicUrl ?? apiUrl;
+    const socket = getOperatorSocket(url.trim(), session?.token ?? null);
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
     function onConnect() {
+      clearTimeout(retryTimer);
       setSocketStatus('connected');
     }
     function onDisconnect() {
@@ -126,6 +130,11 @@ export default function OperadorScreen() {
     }
     function onConnectError() {
       setSocketStatus('error');
+      // Namespace rejections (including rate limits) need an explicit retry.
+      if (!socket.active) {
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => socket.connect(), 60000);
+      }
     }
 
     function onEvent(payload: EventBroadcast) {
@@ -189,7 +198,7 @@ export default function OperadorScreen() {
     // estado actual, no solo esperar el proximo evento. Se defiere con
     // queueMicrotask (no setState sincrono dentro del efecto) siguiendo
     // la regla de react-hooks/set-state-in-effect.
-    if (socket.connected) queueMicrotask(onConnect);
+    queueMicrotask(() => { if (socket.connected) onConnect(); else setSocketStatus('connecting'); });
 
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
@@ -198,17 +207,19 @@ export default function OperadorScreen() {
     socket.on('command:update', onCommandUpdate);
     socket.on('node:status', onNodeStatus);
     return () => {
+      clearTimeout(retryTimer);
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
       socket.off('connect_error', onConnectError);
       socket.off('event', onEvent);
       socket.off('command:update', onCommandUpdate);
       socket.off('node:status', onNodeStatus);
+      closeOperatorSocket();
     };
     // ultimoComando cambia con cada envío; no hace falta reabrir el
     // socket por eso, solo que el closure de onCommandUpdate lo vea.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
+  }, [session, loading, publicUrl]);
 
   // --- Emitir comando ---
   const [enviando, setEnviando] = useState(false);
@@ -237,25 +248,6 @@ export default function OperadorScreen() {
     );
   }
 
-  if (!session) {
-    return (
-      <SafeAreaView edges={['top', 'left', 'right']} style={{ flex: 1, backgroundColor: c.bg }}>
-        <ScrollView contentContainerStyle={{ padding: 20, width: '100%', maxWidth: 620, alignSelf: 'center' }}>
-          <BrandHeader />
-          <Card>
-            <Heading eyebrow="OPERADOR" title="Iniciar sesión" />
-            <Field label="URL del backend" value={apiUrl} onChangeText={setApiUrl} placeholder="http://192.168.1.100:3000" />
-            <Field label="Correo" value={email} onChangeText={setEmail} placeholder="operador@sitciit.mx" keyboardType="email-address" />
-            <Field label="Contraseña" value={password} onChangeText={setPassword} secureTextEntry />
-            {loginError && <Text style={{ color: c.accent, marginBottom: 10, fontSize: 13 }}>{loginError}</Text>}
-            <Action title={loggingIn ? 'Entrando…' : 'Iniciar sesión'} onPress={entrar} disabled={loggingIn || !email || !password} />
-          </Card>
-          <Footer />
-        </ScrollView>
-      </SafeAreaView>
-    );
-  }
-
   const nodos = unidades.flatMap((u) => u.nodes.map((n) => ({ ...n, unitLabel: u.label ?? u.unitCode })));
   const acciones = OPERATOR_ALLOWED_ACTIONS;
 
@@ -264,7 +256,7 @@ export default function OperadorScreen() {
       <ScrollView contentContainerStyle={{ padding: 20, width: '100%', maxWidth: 620, alignSelf: 'center' }}>
         {notice && <AlarmNotice key={notice.id} message={notice.message} onDismiss={() => setNotice(null)} />}
         <BrandHeader />
-        <Heading eyebrow="OPERADOR" title="Centro de operación" aside={session.user.email} />
+        <Heading eyebrow="OPERADOR" title="Centro de operación" aside={session?.user.email ?? 'Alertas sin sesión'} />
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 14 }}>
           <View
@@ -329,7 +321,7 @@ export default function OperadorScreen() {
           )}
         </Card>
 
-        <Card>
+        {session ? <><Card>
           <Heading title="Enviar comando" />
           <Text style={{ color: c.muted, fontSize: 12, marginBottom: 10 }}>Nodo destino</Text>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
@@ -383,7 +375,20 @@ export default function OperadorScreen() {
           </View>
         </Card>
 
-        <Action title="Cerrar sesión" onPress={salir} secondary />
+        <Action title="Cerrar sesión" onPress={salir} secondary /></> : <>
+          <Card>
+            <Heading title="Servidor de alertas" />
+            <Field label="URL del backend" value={apiUrl} onChangeText={setApiUrl} placeholder="http://192.168.1.100:3000" />
+            <Action title="Conectar alertas" onPress={() => setPublicUrl(apiUrl.trim())} />
+          </Card>
+          <Card>
+            <Heading eyebrow="OPERADOR" title="Inicia sesión para enviar comandos" />
+            <Field label="Correo" value={email} onChangeText={setEmail} placeholder="operador@sitciit.mx" keyboardType="email-address" />
+            <Field label="Contraseña" value={password} onChangeText={setPassword} secureTextEntry />
+            {loginError && <Text style={{ color: c.accent, marginBottom: 10, fontSize: 13 }}>{loginError}</Text>}
+            <Action title={loggingIn ? 'Entrando…' : 'Iniciar sesión'} onPress={entrar} disabled={loggingIn || !email || !password} />
+          </Card>
+        </>}
         <Footer />
       </ScrollView>
     </SafeAreaView>

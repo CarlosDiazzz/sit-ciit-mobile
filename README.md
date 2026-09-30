@@ -50,6 +50,10 @@ simple o Socket.IO) se decide ahí antes de seguir — ver `CLAUDE.md`.
 
 ### Avisos de alarma
 
-Con la app abierta, un comando `trigger_alarm` muestra un aviso en Nodo; los eventos `warning` y `critical` recibidos por Socket.IO muestran un aviso en Operador. El aviso usa un icono gráfico rojo y un tono local repetido, sin descargar archivos. «Silenciar y cerrar» detiene el sonido del aviso; para detener la alarma del nodo se envía `stop_alarm`. Los eventos informativos permanecen en el historial.
+Con la app abierta, un comando `trigger_alarm` muestra un aviso en Nodo; los eventos `warning` y `critical` recibidos por Socket.IO muestran un aviso en Operador. El aviso ocupa toda la pantalla en rojo, con icono de peligro blanco, botón blanco y un tono local repetido, sin descargar archivos. «Silenciar y cerrar» detiene el sonido del aviso; para detener la alarma del nodo se envía `stop_alarm`. Los eventos informativos permanecen en el historial.
 
 El audio usa `expo-audio`, compatible con SDK 57 y Expo Go; no pide acceso al micrófono ni habilita reproducción en segundo plano. El volumen depende del dispositivo. Verificar el sonido en Android/iOS reales; los navegadores pueden bloquear la reproducción automática.
+
+Las alertas en Operador se reciben sin iniciar sesión mediante el canal público `/alerts` del backend. El canal comparte resúmenes (unidad, nodo, tipo, severidad y fecha), sin ubicación ni telemetría. Enviar comandos requiere sesión. Actualizar también el backend para habilitar este canal.
+
+Para verificar el cierre de alarma y la cancelación del inicio de audio: `node --test tests/alarm-notice.test.cjs`. El reproductor se libera automáticamente al cerrar el aviso; su limpieza no llama métodos sobre objetos nativos ya liberados.

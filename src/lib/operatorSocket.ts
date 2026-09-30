@@ -1,7 +1,7 @@
 /* Un solo socket compartido hacia sit-ciit-backend para alertas en vivo
  * y avances de comando — igual que sit-ciit-dashboard/src/api/socket.ts:
- * mismo backend, mismo contrato de eventos, autenticado con el mismo
- * JWT que ya usan las llamadas REST de src/lib/api.ts.
+ * Sin sesión usa /alerts (solo resúmenes); con sesión usa el canal
+ * privado y el mismo JWT de las llamadas REST de src/lib/api.ts.
  */
 
 import { io, type Socket } from 'socket.io-client';
@@ -46,16 +46,16 @@ let socketToken: string | null = null;
 /** Reutiliza el socket si ya esta abierto con la misma URL/token; si
  *  cambia cualquiera de los dos (otro backend, otro login), cierra el
  *  anterior en vez de dejarlo huerfano emitiendo con credenciales viejas. */
-export function getOperatorSocket(apiUrl: string, token: string): Socket {
+export function getOperatorSocket(apiUrl: string, token: string | null): Socket {
   if (socket && socketUrl === apiUrl && socketToken === token) return socket;
   socket?.close();
   socketUrl = apiUrl;
   socketToken = token;
-  socket = io(apiUrl, {
+  socket = io(token ? apiUrl : `${apiUrl.replace(/\/$/, '')}/alerts`, {
     autoConnect: true,
     reconnection: true,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 10000,
+    reconnectionDelay: 5000,
+    reconnectionDelayMax: 60000,
     auth: (cb) => cb({ token }),
   });
   return socket;
