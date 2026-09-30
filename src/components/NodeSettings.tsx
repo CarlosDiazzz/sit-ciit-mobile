@@ -36,8 +36,8 @@ export default function NodeSettings(p: NodeSettingsProps) {
     <Action secondary title="Desconectar" onPress={p.onDisconnect} disabled={p.preview || p.status === 'idle'} />
     {divider}<Heading title="GPS y muestreo" />
     {field('gpsIntervalMs', 'Intervalo de lecturas GPS (ms)', true)}{field('samplingMs', 'Intervalo de publicación (ms)', true)}
-    <View style={s.switchRow}><Text style={{ flex: 1, color: c.ink }}>Publicar automáticamente</Text><Switch accessibilityLabel="Publicar automáticamente" value={p.autoPublish} onValueChange={p.setAutoPublish} disabled={p.preview || p.status !== 'connected'} /></View>
-    <Action title="Publicar una vez" onPress={p.onPublish} disabled={p.preview || p.status !== 'connected'} />
+    <View style={s.switchRow}><View style={{ flex: 1 }}><Text style={{ color: c.ink }}>Capturar y publicar automáticamente</Text><Text style={[s.note, { color: c.muted, marginTop: 4, marginBottom: 0 }]}>Sigue guardando en el dispositivo si se pierde la conexión.</Text></View><Switch accessibilityLabel="Capturar y publicar automáticamente" value={p.autoPublish} onValueChange={p.setAutoPublish} disabled={p.preview || p.configured !== true} /></View>
+    <Action title="Capturar y encolar una lectura" onPress={p.onPublish} disabled={p.preview || p.configured !== true} />
     {divider}<Heading title="Impacto y calibración" />
     {field('impactThresholdG', 'Umbral de impacto (g)', true)}
     <Text style={[s.note, { color: c.muted }]}>Inclinación: {p.angle == null ? 'Sin lectura' : `${p.angle.toFixed(0)}° respecto a la referencia`}{p.sustained ? ' · Sostenida' : ''}</Text>

@@ -1,4 +1,5 @@
 import { Image, Pressable, StyleSheet, Text, View, type ViewStyle } from 'react-native';
+import { SymbolView } from 'expo-symbols';
 import type { ReactNode } from 'react';
 import { useZendaTheme } from '@/src/theme/ZendaTheme';
 
@@ -9,7 +10,7 @@ export function BrandHeader() {
       <Image source={c.dark ? require('../../zendaLogoOscuro.png') : require('../../LogoClaro.png')} style={s.logo} accessibilityLabel="Logo de Zenda" resizeMode="contain" />
       <View><Text style={[s.wordmark, { color: c.ink }]}>zenda<Text style={{ color: c.gold }}>.</Text></Text><Text style={[s.brandCaption, { color: c.muted }]}>CONECTAMOS EL CAMINO</Text></View>
     </View>
-    <Pressable accessibilityRole="button" accessibilityLabel={c.dark ? 'Activar modo claro' : 'Activar modo oscuro'} onPress={toggle} style={[s.themeButton, { borderColor: c.line, backgroundColor: c.card }]}><Text style={{ color: c.ink, fontSize: 23 }}>{c.dark ? '☀' : '☾'}</Text></Pressable>
+    <Pressable accessibilityRole="button" accessibilityLabel={c.dark ? 'Activar modo claro' : 'Activar modo oscuro'} onPress={toggle} style={[s.themeButton, { borderColor: c.line, backgroundColor: c.card }]}><SymbolView name={c.dark ? { ios: 'sun.max', android: 'light_mode', web: 'light_mode' } : { ios: 'moon', android: 'dark_mode', web: 'dark_mode' }} tintColor={c.ink} size={21} /></Pressable>
   </View>;
 }
 export function Card({ children, style }: { children: ReactNode; style?: ViewStyle }) {
