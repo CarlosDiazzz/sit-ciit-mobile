@@ -33,6 +33,15 @@ const ACCION_LABEL: Record<CmdAction, string> = {
 
 const MAX_ALERTAS = 40;
 
+/** Feed unificado: eventos reales de sensor (impact/door/rollover/
+ *  signal_lost/etc.) MAS el resultado de una alarma activada/detenida
+ *  por cualquiera (dashboard u otro operador) — trigger_alarm/stop_alarm
+ *  son comandos, no eventos, asi que no llegaban por 'event' y por eso
+ *  no se veian aqui aunque si se ejecutaran de verdad en el nodo. */
+type Actividad =
+  | { tipo: 'evento'; ts: number; data: EventBroadcast }
+  | { tipo: 'comando'; ts: number; nodeId: string; status: 'executed' | 'rejected'; reason: string | null };
+
 function haceCuanto(ts: number): string {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
   if (s < 60) return `hace ${s} s`;
@@ -95,7 +104,7 @@ export default function OperadorScreen() {
   const [socketStatus, setSocketStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
 
   // --- Alertas y avances de comando en vivo ---
-  const [alertas, setAlertas] = useState<EventBroadcast[]>([]);
+  const [alertas, setAlertas] = useState<Actividad[]>([]);
   const [ultimoComando, setUltimoComando] = useState<{ cmdId: string; targetNodeCode: string; action: CmdAction } | null>(
     null,
   );
@@ -103,7 +112,6 @@ export default function OperadorScreen() {
 
   useEffect(() => {
     if (!session) return;
-    setSocketStatus('connecting');
     const socket = getOperatorSocket(session.apiUrl, session.token);
 
     function onConnect() {
@@ -120,12 +128,35 @@ export default function OperadorScreen() {
       if (payload.severity === 'critical') {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       }
-      setAlertas((prev) => [payload, ...prev].slice(0, MAX_ALERTAS));
+      setAlertas((prev) => [{ tipo: 'evento' as const, ts: payload.ts, data: payload }, ...prev].slice(0, MAX_ALERTAS));
     }
     function onCommandUpdate(payload: CommandUpdate) {
       setAvanceComando((prev) =>
         !ultimoComando || payload.cmdId !== ultimoComando.cmdId ? prev : payload,
       );
+      // "executed"/"rejected" son el desenlace real de un comando
+      // (activar/detener alarma) en el nodo — se muestran en el mismo
+      // feed que los eventos aunque los haya mandado el dashboard u otro
+      // operador, no solo los que este celular mismo envio. "delivered"
+      // se omite: es solo un acuse a medio camino, no un desenlace.
+      const desenlace = payload.status;
+      if (desenlace === 'executed' || desenlace === 'rejected') {
+        void Haptics.notificationAsync(
+          desenlace === 'executed' ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Warning,
+        );
+        setAlertas((prev) =>
+          [
+            {
+              tipo: 'comando' as const,
+              ts: payload.occurredAt,
+              nodeId: payload.nodeId,
+              status: desenlace,
+              reason: payload.reason,
+            },
+            ...prev,
+          ].slice(0, MAX_ALERTAS),
+        );
+      }
     }
     // El estado de /units es una foto del momento del login: sin esto,
     // un nodo que se conecta o se cae despues se queda mostrado con el
@@ -148,8 +179,10 @@ export default function OperadorScreen() {
 
     // Si el socket ya estaba conectado (se reutiliza el singleton entre
     // remontajes), 'connect' no vuelve a disparar — hay que leer el
-    // estado actual, no solo esperar el proximo evento.
-    setSocketStatus(socket.connected ? 'connected' : 'connecting');
+    // estado actual, no solo esperar el proximo evento. Se defiere con
+    // queueMicrotask (no setState sincrono dentro del efecto) siguiendo
+    // la regla de react-hooks/set-state-in-effect.
+    if (socket.connected) queueMicrotask(onConnect);
 
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
@@ -250,38 +283,41 @@ export default function OperadorScreen() {
               Esperando conexión con el servidor para recibir alertas en vivo…
             </Text>
           ) : alertas.length === 0 ? (
-            <Text style={{ color: c.muted, fontSize: 13 }}>Sin alertas todavía. Aparecen en cuanto ocurre un evento real.</Text>
+            <Text style={{ color: c.muted, fontSize: 13 }}>Sin alertas todavía. Aparecen en cuanto ocurre un evento o se active una alarma real.</Text>
           ) : (
-            alertas.map((a, i) => (
-              <View
-                key={`${a.ts}-${i}`}
-                style={{
-                  paddingVertical: 10,
-                  borderTopWidth: i === 0 ? 0 : 1,
-                  borderColor: c.line,
-                  flexDirection: 'row',
-                  gap: 10,
-                  alignItems: 'flex-start',
-                }}
-              >
+            alertas.map((a, i) => {
+              const critico = a.tipo === 'evento' ? a.data.severity === 'critical' : a.status === 'rejected';
+              const color = critico ? c.accent : a.tipo === 'evento' && a.data.severity === 'warning' ? c.gold : c.green;
+              const titulo =
+                a.tipo === 'evento'
+                  ? a.data.kind.replace(/_/g, ' ')
+                  : a.status === 'executed'
+                    ? 'Alarma / comando ejecutado'
+                    : `Comando rechazado${a.reason ? ` — ${a.reason}` : ''}`;
+              const detalle =
+                a.tipo === 'evento'
+                  ? `${a.data.unitId}${a.data.nodeId ? ` · ${a.data.nodeId}` : ''} · ${haceCuanto(a.ts)}`
+                  : `${a.nodeId} · ${haceCuanto(a.ts)}`;
+              return (
                 <View
+                  key={`${a.ts}-${i}`}
                   style={{
-                    width: 8,
-                    height: 8,
-                    borderRadius: 4,
-                    marginTop: 5,
-                    backgroundColor: a.severity === 'critical' ? c.accent : a.severity === 'warning' ? c.gold : c.green,
+                    paddingVertical: 10,
+                    borderTopWidth: i === 0 ? 0 : 1,
+                    borderColor: c.line,
+                    flexDirection: 'row',
+                    gap: 10,
+                    alignItems: 'flex-start',
                   }}
-                />
-                <View style={{ flex: 1 }}>
-                  <Text style={{ color: c.ink, fontWeight: '700', fontSize: 13 }}>{a.kind.replace(/_/g, ' ')}</Text>
-                  <Text style={{ color: c.muted, fontSize: 11 }}>
-                    {a.unitId}
-                    {a.nodeId ? ` · ${a.nodeId}` : ''} · {haceCuanto(a.ts)}
-                  </Text>
+                >
+                  <View style={{ width: 8, height: 8, borderRadius: 4, marginTop: 5, backgroundColor: color }} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: c.ink, fontWeight: '700', fontSize: 13 }}>{titulo}</Text>
+                    <Text style={{ color: c.muted, fontSize: 11 }}>{detalle}</Text>
+                  </View>
                 </View>
-              </View>
-            ))
+              );
+            })
           )}
         </Card>
 

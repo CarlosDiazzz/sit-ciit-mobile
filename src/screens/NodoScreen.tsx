@@ -191,6 +191,29 @@ export default function NodoScreen() {
   const [nodeSecret, setNodeSecret] = useState('');
   const seqRef = useRef(0);
 
+  // Espejo en refs de la identidad: el listener 'message' del cliente
+  // MQTT se registra una sola vez dentro de connect() (llamado desde el
+  // useEffect de auto-reconexion, ANTES de que los setNodeSecret/
+  // setIsBackup de ese mismo efecto lleguen a un render nuevo) y de ahi
+  // cuelga handleCommand -> publishAck. Si publishAck lee nodeSecret/role
+  // directo del closure, se queda pegado para siempre a los valores
+  // default del primer render (nodeSecret='', role='primary') aunque la
+  // conexion MQTT en si use las credenciales correctas via `cfg` — asi
+  // el ack sale con nodeSecret vacio y el backend lo descarta sin que
+  // se note (nunca llega ningun error de red). Los refs si se actualizan
+  // porque los efectos que los sincronizan no dependen de cuando se creo
+  // el listener.
+  const nodeIdRef = useRef(nodeId);
+  const unitIdRef = useRef(unitId);
+  const roleRef = useRef(role);
+  const nodeSecretRef = useRef(nodeSecret);
+  useEffect(() => {
+    nodeIdRef.current = nodeId;
+    unitIdRef.current = unitId;
+    roleRef.current = role;
+    nodeSecretRef.current = nodeSecret;
+  }, [nodeId, unitId, role, nodeSecret]);
+
   // null mientras se lee SecureStore; false = sin configurar (mostrar
   // formulario); true = configurado (mostrar resumen + Reconfigurar).
   const [configured, setConfigured] = useState<boolean | null>(null);
@@ -992,10 +1015,10 @@ export default function NodoScreen() {
     const payload = JSON.stringify({
       contractVersion: CONTRACT_VERSION,
       msgId: uuidv4(),
-      nodeId,
-      unitId,
-      role,
-      nodeSecret,
+      nodeId: nodeIdRef.current,
+      unitId: unitIdRef.current,
+      role: roleRef.current,
+      nodeSecret: nodeSecretRef.current,
       seq: seqRef.current,
       ts: Date.now(),
       type: 'ack',
@@ -1004,7 +1027,7 @@ export default function NodoScreen() {
       ...(reason ? { reason } : {}),
     });
 
-    void encolarMensaje(`sitciit/${nodeId}/ack`, payload, 'ack');
+    void encolarMensaje(`sitciit/${nodeIdRef.current}/ack`, payload, 'ack');
   }
 
   /** Comandos ya ejecutados, para no repetir la accion si el broker
