@@ -1,4 +1,4 @@
-import { Image, Pressable, StyleSheet, Text, View, type ViewStyle } from 'react-native';
+import { Image, Pressable, StyleSheet, Text, TextInput, View, type ViewStyle } from 'react-native';
 import { SymbolView } from 'expo-symbols';
 import type { ReactNode } from 'react';
 import { useZendaTheme } from '@/src/theme/ZendaTheme';
@@ -25,6 +25,40 @@ export function Action({ title, onPress, disabled, secondary = false }: { title:
   const { colors: c } = useZendaTheme();
   return <Pressable accessibilityRole="button" accessibilityState={{ disabled: !!disabled }} disabled={disabled} onPress={onPress} style={({ pressed }) => [s.action, { backgroundColor: secondary ? c.soft : '#782D40', opacity: disabled ? 0.45 : pressed ? 0.75 : 1 }]}><Text style={{ fontWeight: '700', color: secondary ? c.accent : '#FFF', textAlign: 'center' }}>{title}</Text></Pressable>;
 }
+export function Field({
+  label,
+  value,
+  onChangeText,
+  placeholder,
+  secureTextEntry,
+  keyboardType,
+  autoCapitalize = 'none',
+}: {
+  label: string;
+  value: string;
+  onChangeText: (t: string) => void;
+  placeholder?: string;
+  secureTextEntry?: boolean;
+  keyboardType?: 'default' | 'numeric' | 'email-address';
+  autoCapitalize?: 'none' | 'sentences';
+}) {
+  const { colors: c } = useZendaTheme();
+  return (
+    <View style={{ marginBottom: 14 }}>
+      <Text style={[s.small, { color: c.muted, marginBottom: 6, fontWeight: '700' }]}>{label}</Text>
+      <TextInput
+        value={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor={c.muted}
+        secureTextEntry={secureTextEntry}
+        keyboardType={keyboardType}
+        autoCapitalize={autoCapitalize}
+        style={[s.input, { color: c.ink, borderColor: c.line, backgroundColor: c.bg }]}
+      />
+    </View>
+  );
+}
 export function Footer() {
   const { colors: c } = useZendaTheme();
   return <View style={s.footer}><View style={{ width: 30, height: 3, backgroundColor: c.gold, marginBottom: 12 }} /><Text style={[s.small, { color: c.muted }]}>ZENDA · INTELIGENCIA EN MOVIMIENTO</Text><Text style={[s.small, { color: c.muted, marginTop: 5 }]}>Sistema de monitoreo · Corredor Interoceánico</Text></View>;
@@ -32,5 +66,5 @@ export function Footer() {
 const s = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 30 },
   brand: { flexDirection: 'row', alignItems: 'center', gap: 10 }, logo: { width: 54, height: 54 }, wordmark: { fontSize: 34, fontWeight: '800', letterSpacing: -1.7 }, brandCaption: { fontSize: 7, fontWeight: '700', letterSpacing: 1.5 }, themeButton: { width: 44, height: 44, borderWidth: 1, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
-  card: { borderWidth: 1, borderRadius: 24, padding: 20, marginBottom: 14 }, heading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 18 }, headingText: { fontSize: 18, fontWeight: '700', letterSpacing: -0.4 }, eyebrow: { fontSize: 10, fontWeight: '700', letterSpacing: 1.8, marginBottom: 8 }, small: { fontSize: 10, lineHeight: 16 }, action: { minHeight: 48, borderRadius: 14, padding: 14, justifyContent: 'center' }, footer: { alignItems: 'center', paddingVertical: 28 },
+  card: { borderWidth: 1, borderRadius: 24, padding: 20, marginBottom: 14 }, heading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 18 }, headingText: { fontSize: 18, fontWeight: '700', letterSpacing: -0.4 }, eyebrow: { fontSize: 10, fontWeight: '700', letterSpacing: 1.8, marginBottom: 8 }, small: { fontSize: 10, lineHeight: 16 }, action: { minHeight: 48, borderRadius: 14, padding: 14, justifyContent: 'center' }, footer: { alignItems: 'center', paddingVertical: 28 }, input: { minHeight: 46, borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, fontSize: 14 },
 });

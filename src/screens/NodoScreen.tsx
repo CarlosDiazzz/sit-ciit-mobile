@@ -981,11 +981,13 @@ export default function NodoScreen() {
   }, [autoPublish, configured, samplingMs, nodeId, unitId, role, nodeSecret]);
 
   /** Confirma un comando hacia la nube. El backend mueve el estado del
-   *  comando con esto (sent -> delivered -> executed/rejected). */
+   *  comando con esto (sent -> delivered -> executed/rejected).
+   *
+   *  A la cola en vez de directo: si el celular se desconecta justo
+   *  entre ejecutar la accion y publicar el ack, ese ack se perdia para
+   *  siempre y el comando quedaba pegado en "Entregado" en el dashboard
+   *  aunque si se hubiera ejecutado. Mismo patron que publishEvent. */
   function publishAck(cmdId: string, ackStatus: 'delivered' | 'executed' | 'rejected', reason?: string) {
-    const client = clientRef.current;
-    if (!client) return;
-
     seqRef.current += 1;
     const payload = JSON.stringify({
       contractVersion: CONTRACT_VERSION,
@@ -1002,9 +1004,7 @@ export default function NodoScreen() {
       ...(reason ? { reason } : {}),
     });
 
-    client.publish(`sitciit/${nodeId}/ack`, payload, { qos: 1 }, (err) => {
-      if (err) appendLog(`Fallo al confirmar ${ackStatus}: ${err.message}`);
-    });
+    void encolarMensaje(`sitciit/${nodeId}/ack`, payload, 'ack');
   }
 
   /** Comandos ya ejecutados, para no repetir la accion si el broker
